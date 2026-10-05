@@ -144,13 +144,17 @@ class TtResNet34:
         )
         self.layers = [[TtBasicBlock(device, blk) for blk in getattr(ref, f"layer{i}")] for i in range(1, 5)]
 
-    def preprocess(self, imgs: torch.Tensor) -> FeatureMap:
-        """(N, 3, H, W) float torch -> device FeatureMap in conv2d layout."""
+    def host_input(self, imgs: torch.Tensor) -> ttnn.Tensor:
+        """(N, 3, H, W) float torch -> host tensor in conv2d layout (1, 1, N*H*W, 16)."""
         n, c, h, w = imgs.shape
         x = torch.nn.functional.pad(imgs, (0, 0, 0, 0, 0, self.STEM_IN_CHANNELS - c))
         x = x.permute(0, 2, 3, 1).reshape(1, 1, n * h * w, self.STEM_IN_CHANNELS)
-        t = ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
-        return FeatureMap(t, n, h, w, self.STEM_IN_CHANNELS)
+        return ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
+
+    def preprocess(self, imgs: torch.Tensor) -> FeatureMap:
+        """(N, 3, H, W) float torch -> device FeatureMap in conv2d layout."""
+        n, _, h, w = imgs.shape
+        return FeatureMap(ttnn.to_device(self.host_input(imgs), self.device), n, h, w, self.STEM_IN_CHANNELS)
 
     def __call__(self, x: FeatureMap) -> List[FeatureMap]:
         x = self.stem(x)

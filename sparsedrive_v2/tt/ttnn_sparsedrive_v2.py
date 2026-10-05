@@ -26,8 +26,12 @@ import torch
 
 import ttnn
 from models.experimental.sparsedrive_v2.reference.sparsedrive_v2 import SparseDriveV2Config
-from models.experimental.sparsedrive_v2.tt.ttnn_backbone import TtSparseBackbone
-from models.experimental.sparsedrive_v2.tt.ttnn_dfa import TtDeformableFeatureAggregation, build_camera_context
+from models.experimental.sparsedrive_v2.tt.ttnn_backbone import FeatureMap, TtSparseBackbone
+from models.experimental.sparsedrive_v2.tt.ttnn_dfa import (
+    TtDeformableFeatureAggregation,
+    camera_context,
+    camera_host_tensors,
+)
 from models.experimental.sparsedrive_v2.tt.ttnn_ops import (
     ACT_DTYPE,
     TtLayerNorm,
@@ -238,22 +242,43 @@ class TtSparseDriveV2:
             "traj_out": HiLoTable(device, traj_out),
         }
 
-    def encode(self, inputs: Dict[str, torch.Tensor]):
-        """Backbone + per-frame context.  ``inputs`` as returned by ``common.sample_inputs`` (bs=1)."""
-        feats = self.backbone(inputs["imgs"][0])
+    # -- inputs ----------------------------------------------------------------
+
+    def host_inputs(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, ttnn.Tensor]:
+        """Host tensors of one frame (``common.sample_inputs`` layout, batch size 1)."""
+        imgs = inputs["imgs"][0]
+        self._img_shape = (imgs.shape[0], imgs.shape[2], imgs.shape[3])
+        host = {
+            "imgs": self.backbone.resnet.host_input(imgs),
+            "status": ttnn.from_torch(
+                inputs["status_feature"].reshape(1, 1, -1).float(), dtype=ACT_DTYPE, layout=ttnn.TILE_LAYOUT
+            ),
+        }
+        host.update(camera_host_tensors(inputs["projection_mat"][0], inputs["image_wh"][0]))
+        return host
+
+    def to_device_inputs(self, host: Dict[str, ttnn.Tensor]) -> Dict[str, ttnn.Tensor]:
+        return {k: ttnn.to_device(v, self.device) for k, v in host.items()}
+
+    # -- device forward (trace-safe: no host transfers) --------------------------
+
+    def encode(self, dev: Dict[str, ttnn.Tensor]):
+        """Backbone + per-frame decoder context from device inputs."""
+        n, h, w = self._img_shape
+        stem_in = FeatureMap(dev["imgs"], n, h, w, self.backbone.resnet.STEM_IN_CHANNELS)
+        feats = self.backbone.fpn(self.backbone.resnet(stem_in))
         values = []
         for f in feats:
             t = ttnn.to_layout(f.tensor, ttnn.ROW_MAJOR_LAYOUT)
             values.append(ttnn.reshape(t, (f.n, f.h, f.w, f.c)))
         last = feats[-1]
         img_value = ttnn.reshape(last.tensor, (1, last.n * last.h * last.w, last.c))
-        status = to_device(inputs["status_feature"].reshape(1, 1, -1), self.device, ACT_DTYPE)
-        cam = build_camera_context(self.device, inputs["projection_mat"][0], inputs["image_wh"][0])
+        cam = camera_context(dev)
         return {
             "feats": feats,
             "values": values,
             "img_value": img_value,
-            "status": self.status_fc(status),
+            "status": self.status_fc(dev["status"]),
             "frames": [layer.prepare_frame(cam) for layer in self.layers],
         }
 
@@ -264,8 +289,38 @@ class TtSparseDriveV2:
             outputs.update(out)
         return outputs
 
-    def __call__(self, inputs, forced=None):
-        return self.decode(self.encode(inputs), forced)
+    def forward(self, dev: Dict[str, ttnn.Tensor], forced=None):
+        return self.decode(self.encode(dev), forced)
+
+    def __call__(self, inputs: Dict[str, torch.Tensor], forced=None):
+        return self.forward(self.to_device_inputs(self.host_inputs(inputs)), forced)
+
+
+class TracedSparseDriveV2:
+    """Captures the whole forward once and replays it; only the input copies run per frame.
+
+    The device must be opened with a ``trace_region_size`` large enough for ~1500 ops.
+    """
+
+    def __init__(self, model: TtSparseDriveV2, example_inputs: Dict[str, torch.Tensor]):
+        self.model = model
+        self.device = model.device
+        self.dev_inputs = model.to_device_inputs(model.host_inputs(example_inputs))
+        model.forward(self.dev_inputs)  # compile + prepare conv weights outside the trace
+        ttnn.synchronize_device(self.device)
+        self.trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
+        self.outputs = model.forward(self.dev_inputs)
+        ttnn.end_trace_capture(self.device, self.trace_id, cq_id=0)
+        ttnn.synchronize_device(self.device)
+
+    def __call__(self, inputs: Dict[str, torch.Tensor], blocking: bool = False) -> Dict[str, ttnn.Tensor]:
+        for k, host in self.model.host_inputs(inputs).items():
+            ttnn.copy_host_to_device_tensor(host, self.dev_inputs[k])
+        ttnn.execute_trace(self.device, self.trace_id, cq_id=0, blocking=blocking)
+        return self.outputs
+
+    def release(self):
+        ttnn.release_trace(self.device, self.trace_id)
 
 
 def outputs_to_torch(out: Dict[str, ttnn.Tensor], config: SparseDriveV2Config) -> Dict[str, torch.Tensor]:

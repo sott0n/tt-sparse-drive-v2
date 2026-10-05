@@ -28,7 +28,6 @@ import ttnn
 from models.experimental.sparsedrive_v2.tt.ttnn_ops import ACT_DTYPE, TtLayerNorm, TtLinear, to_device
 
 PAD_LOGIT = -30000.0
-GRID_BATCH = 8  # key points packed per grid_sample grid row (batch_output_channels)
 
 
 def round_up(x: int, m: int = 32) -> int:
@@ -48,15 +47,30 @@ class CameraContext:
     cam12: ttnn.Tensor
 
 
-def build_camera_context(device, projection_mat: torch.Tensor, image_wh: torch.Tensor) -> CameraContext:
-    """projection_mat (cams, 4, 4), image_wh (cams, 2) for one frame."""
+def camera_host_tensors(projection_mat: torch.Tensor, image_wh: torch.Tensor) -> Dict[str, ttnn.Tensor]:
+    """Host tensors of one frame's cameras; projection_mat (cams, 4, 4), image_wh (cams, 2)."""
     proj = projection_mat.float()
     norm = proj.clone()
     norm[:, 0] /= image_wh[:, 0:1]
     norm[:, 1] /= image_wh[:, 1:2]
-    coef = [[to_device(norm[:, r, k].reshape(-1, 1, 1), device, ttnn.float32) for k in range(4)] for r in range(3)]
-    cam12 = to_device(proj[:, :3].reshape(-1, 1, 12), device)
-    return CameraContext(coef, cam12)
+    host = {
+        f"coef_{r}{k}": ttnn.from_torch(norm[:, r, k].reshape(-1, 1, 1), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
+        for r in range(3)
+        for k in range(4)
+    }
+    host["cam12"] = ttnn.from_torch(proj[:, :3].reshape(-1, 1, 12), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    return host
+
+
+def camera_context(tensors: Dict[str, ttnn.Tensor]) -> CameraContext:
+    """CameraContext from the device copies of :func:`camera_host_tensors`."""
+    coef = [[tensors[f"coef_{r}{k}"] for k in range(4)] for r in range(3)]
+    return CameraContext(coef, tensors["cam12"])
+
+
+def build_camera_context(device, projection_mat: torch.Tensor, image_wh: torch.Tensor) -> CameraContext:
+    host = camera_host_tensors(projection_mat, image_wh)
+    return camera_context({k: ttnn.to_device(v, device) for k, v in host.items()})
 
 
 class TtDeformableFeatureAggregation:
@@ -74,7 +88,7 @@ class TtDeformableFeatureAggregation:
 
         z = torch.zeros(self.Pp)
         z[: self.P] = torch.tensor(kps.fix_height)[(p // nl) % nh]
-        self.z = z
+        self.z_dev = to_device(z.reshape(1, 1, -1), device, ttnn.float32)
 
         # learnable_fc rows are (point, xy) interleaved; regroup into [x(Pp) | y(Pp)].
         w, b = kps.learnable_fc.weight.detach(), kps.learnable_fc.bias.detach()
@@ -109,6 +123,20 @@ class TtDeformableFeatureAggregation:
         seg[torch.arange(seg.shape[0]), torch.arange(seg.shape[0]) // (self.L * self.Pp)] = 1
         self.group_sum = to_device(seg, device, ttnn.float32)
 
+        # The auto-selected config for the (cams, n) batched G x Pp @ Pp x C matmul runs on
+        # 8 cores; spread the batch over the whole grid instead (~4x faster).
+        grid = device.compute_with_storage_grid_size()
+        self.core_grid = ttnn.CoreGrid(y=grid.y, x=grid.x)
+        k_tiles = self.Pp // 32
+        self.reduce_pc = ttnn.MatmulMultiCoreReuseProgramConfig(
+            compute_with_storage_grid_size=(grid.x, grid.y),
+            in0_block_w=next(b for b in (4, 3, 2, 1) if k_tiles % b == 0),
+            out_subblock_h=1,
+            out_subblock_w=4,
+            per_core_M=1,
+            per_core_N=self.C // 32,
+        )
+
     # -- anchor tables -------------------------------------------------------
 
     def anchor_table(self, xy: torch.Tensor) -> torch.Tensor:
@@ -124,8 +152,7 @@ class TtDeformableFeatureAggregation:
         e = self.cam_ln1(self.cam_fc1(cam.cam12, activation="relu"))
         cam_embed = self.cam_ln2(self.cam_fc2(e, activation="relu"))  # (cams, 1, C)
         cam_embed = ttnn.typecast(cam_embed, ACT_DTYPE) if cam_embed.dtype != ACT_DTYPE else cam_embed
-        z = to_device(self.z.reshape(1, 1, -1), self.device, ttnn.float32)
-        zc = [ttnn.add(ttnn.multiply(z, cam.coef[r][2]), cam.coef[r][3]) for r in range(3)]  # (cams, 1, Pp)
+        zc = [ttnn.add(ttnn.multiply(self.z_dev, cam.coef[r][2]), cam.coef[r][3]) for r in range(3)]  # (cams, 1, Pp)
         return {"cam_embed": cam_embed, "zc": zc, "coef": cam.coef}
 
     # -- forward -------------------------------------------------------------
@@ -176,7 +203,8 @@ class TtDeformableFeatureAggregation:
         logits = self.weights_fc(feat, dtype=ttnn.float32)  # (cams, n, G*L*Pp)
         shift = ttnn.max(ttnn.max(logits, dim=-1, keepdim=True), dim=0, keepdim=True)
         ex = ttnn.multiply(ttnn.exp(ttnn.subtract(logits, shift)), ttnn.repeat(keep, (1, 1, G * L)))
-        den = ttnn.sum(ttnn.matmul(ex, self.group_sum, compute_kernel_config=self.kps_fc.cfg), dim=0, keepdim=True)
+        den = ttnn.matmul(ex, self.group_sum, compute_kernel_config=self.kps_fc.cfg, core_grid=self.core_grid)
+        den = ttnn.sum(den, dim=0, keepdim=True)
         ex = ttnn.reshape(ttnn.typecast(ex, ttnn.bfloat16), (cams, n, G, L * Pp))
 
         # Sampling grid in [-1, 1].  The kernel skips a camera unless the point lies strictly
@@ -184,21 +212,21 @@ class TtDeformableFeatureAggregation:
         def to_grid(t):
             t = ttnn.clamp(ttnn.subtract(ttnn.multiply(t, 2.0), 1.0), min=-1.5, max=1.5)
             t = ttnn.add(ttnn.multiply(t, valid), ttnn.multiply(ttnn.subtract(valid, 1.0), 3.0))
-            return ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
+            return ttnn.reshape(t, (cams, n, 1, Pp))
 
-        k = GRID_BATCH
-        grid = ttnn.stack([to_grid(x), to_grid(y)], dim=-1)  # (cams, n, Pp, 2)
-        grid = ttnn.reshape(grid, (cams, n, Pp // k, 2 * k))
+        # interleave (x, y) per point: (cams, n, 2, Pp) -> (cams, n, Pp, 2)
+        grid = ttnn.transpose(ttnn.concat([to_grid(x), to_grid(y)], dim=2), -2, -1)
+        grid = ttnn.to_layout(grid, ttnn.ROW_MAJOR_LAYOUT)
 
         acc = None
         for lvl in range(L):
-            sampled = ttnn.grid_sample(values[lvl], grid, batch_output_channels=True)
-            sampled = ttnn.to_layout(ttnn.reshape(sampled, (cams, n, Pp, C)), ttnn.TILE_LAYOUT)
+            sampled = ttnn.to_layout(ttnn.grid_sample(values[lvl], grid), ttnn.TILE_LAYOUT)  # (cams, n, Pp, C)
             r = ttnn.matmul(
                 ex[:, :, :, lvl * Pp : (lvl + 1) * Pp],
                 sampled,
                 dtype=ttnn.float32,
                 compute_kernel_config=self.kps_fc.cfg,
+                program_config=self.reduce_pc,
             )
             ttnn.deallocate(sampled)
             acc = r if acc is None else ttnn.add(acc, r)

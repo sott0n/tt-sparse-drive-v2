@@ -53,6 +53,7 @@ benchmark.
 pytest models/experimental/sparsedrive_v2/tests/pcc/test_backbone.py      # ResNet-34 + FPN
 pytest models/experimental/sparsedrive_v2/tests/pcc/test_dfa.py           # deformable aggregation
 pytest models/experimental/sparsedrive_v2/tests/pcc/test_sparsedrive_v2.py  # end to end
+pytest models/experimental/sparsedrive_v2/tests/perf/test_perf.py         # eager vs traced latency
 ```
 
 The decoder narrows its candidates with top-k twice. A tiny score difference near the k-th
@@ -82,20 +83,46 @@ the two settings give the same PCC and the same latency.
 
 ## Performance
 
-Eager forward on Blackhole p300c (one chip), batch 1, warm program cache:
+Blackhole p300c (one chip), batch 1, warm program cache
+(`tests/perf/test_perf.py`):
 
-| Part | Latency |
-|---|---|
-| Backbone + FPN | 26 ms |
-| Decoder layer 0 | 255 ms (path DFA: 252 ms) |
-| Decoder layer 1 | 63 ms |
-| **Total** | **~344 ms** |
+| Mode | Throughput (frames pipelined) | Single-frame latency |
+|---|---|---|
+| eager | 244 ms (4.1 FPS) | 255 ms |
+| traced (`TracedSparseDriveV2`) | 244 ms (4.1 FPS) | 255 ms |
 
-Tracing the decoder (it is trace-safe) gives the same time: the forward is device-bound.
-Almost all of it is the layer-0 path DFA, which takes 512k key points x 3 cameras x
-4 levels of bilinear samples. Of that time, `grid_sample` is ~90 ms and the batched-matmul
-reduction ~80 ms. The rest is mostly layout conversions of the sampled tensor.
+The forward is device-bound, so tracing does not change the time. The decoder
+dispatches far faster than the device runs it. Of the single-frame latency, ~21 ms is
+the input pipeline: host preprocessing takes 12 ms, and the host-to-device copy of the
+images, padded to 16 channels for the stem conv, takes 9 ms.
 
-The next step is a fused deformable-aggregation op. It would sample, weight and
-accumulate in one kernel without materializing the samples, and it would skip cameras a
-point does not project into. That is the same strategy as upstream's CUDA kernel.
+Device kernel time per stage, from the device profiler
+(`tests/perf/test_profile_forward.py`, warm iteration):
+
+| Stage | Ops | Device time (before tuning) |
+|---|---|---|
+| Backbone + FPN | 322 | 5 ms |
+| Decoder layer 0 | 591 | 254 ms |
+| Decoder layer 1 | 573 | 62 ms |
+
+Tuning applied after profiling:
+
+- The DFA's batched reduction matmul now uses an explicit program config. The auto
+  config ran it on 8 of 110 cores; the change cut that matmul from ~5 ms to ~1.3 ms per call.
+- `grid_sample` no longer uses grid batching, which removes a row-major reshape copy of
+  every sampled tensor.
+- The sampling grid is built with concat + transpose instead of `stack`.
+
+The dominant remaining cost is `grid_sample` (~90 ms in layer 0), which samples
+512k key points x 3 cameras x 4 levels, together with tilizing its output. The next
+step is a fused deformable-aggregation op. It would sample, weight and accumulate in
+one kernel without materializing the samples, and it would skip cameras a point does
+not project into, as upstream's CUDA kernel does.
+
+To profile:
+
+```bash
+python -m tracy -p -r -v -m pytest models/experimental/sparsedrive_v2/tests/perf/test_profile_forward.py
+tt-perf-report generated/profiler/reports/<ts>/ops_perf_results_<ts>.csv \
+    --start-signpost iter1_start --end-signpost iter1_end
+```
