@@ -22,7 +22,12 @@ TILE_HW, TILE_WIDTH = 1024, 32
 NUM_LEVELS = 4
 MAX_SPATIAL = 8192  # keeps the reader's Q16.16 pixel math inside int32
 
-CB_EX, CB_GRID, CB_V_RM, CB_V, CB_ET, CB_W, CB_A, CB_ACC, CB_A_T = range(9)
+NUM_READERS = 2  # NCRISC and BRISC each sample every other key point of each anchor
+
+# Shared by both readers' streams.
+CB_V, CB_A, CB_A_T, CB_ACC = 0, 1, 2, 3
+# Per reader: ex scratch, grid scratch, row-major samples, E, W.
+CB_EX, CB_GRID, CB_V_RM, CB_ET, CB_W = ([4 + 5 * r + k for r in range(NUM_READERS)] for k in range(5))
 
 
 def _cb(index, dtype, page_size, num_pages, cores):
@@ -72,41 +77,51 @@ def deformable_aggregation_fused(
     cores = ttnn.corerange_to_cores(all_cores, num_cores, True)
 
     cbs = [
-        _cb(CB_EX, ttnn.bfloat16, cams * ex_row, 1, all_cores),
-        _cb(CB_GRID, ttnn.float32, cams * grid_row, 1, all_cores),
-        _cb(CB_V_RM, ttnn.bfloat16, TILE_HW * 2, 2 * c_tiles, all_cores),
         _cb(CB_V, ttnn.bfloat16, TILE_HW * 2, 2 * c_tiles, all_cores),
-        _cb(CB_ET, ttnn.bfloat16, TILE_HW * 2, 2, all_cores),
-        _cb(CB_W, ttnn.bfloat16, TILE_HW * 2, 2, all_cores),
         _cb(CB_A, ttnn.bfloat16, TILE_HW * 2, 2, all_cores),
         _cb(CB_A_T, ttnn.bfloat16, TILE_HW * 2, 2, all_cores),
-        _cb(CB_ACC, ttnn.float32, TILE_HW * 4, 2 * c_tiles, all_cores),
+        _cb(CB_ACC, ttnn.float32, TILE_HW * 4, 2 * c_tiles, all_cores),  # two anchors in flight
     ]
+    for r in range(NUM_READERS):
+        cbs += [
+            _cb(CB_EX[r], ttnn.bfloat16, cams * ex_row, 1, all_cores),
+            _cb(CB_GRID[r], ttnn.float32, cams * grid_row, 1, all_cores),
+            _cb(CB_V_RM[r], ttnn.bfloat16, TILE_HW * 2, 2 * c_tiles, all_cores),
+            _cb(CB_ET[r], ttnn.bfloat16, TILE_HW * 2, 2, all_cores),
+            _cb(CB_W[r], ttnn.bfloat16, TILE_HW * 2, 2, all_cores),
+        ]
 
-    reader_ct = [
-        CB_EX,
-        CB_GRID,
-        CB_V_RM,
-        CB_ET,
-        CB_W,
-        cams,
-        num_anchors,
-        num_pts,
-        pp,
-        num_groups,
-        stick,
-        c_tiles,
-        ex_row,
-        grid_row,
-        *(int(v.shape[1]) for v in values),
-        *(int(v.shape[2]) for v in values),
-    ]
-    for t in (ex, grid, *values):
-        reader_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
-    writer_ct = [CB_ACC, c_tiles] + ttnn.TensorAccessorArgs(output).get_compile_time_args()
-    compute_ct = [CB_V_RM, CB_V, CB_ET, CB_W, CB_A, CB_ACC, c_tiles, CB_A_T]
+    accessor_ct = []
+    for t in (ex, grid, *values, output):
+        accessor_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
 
-    reader_rt, writer_rt, compute_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    def reader_ct(r):
+        return [
+            CB_EX[r],
+            CB_GRID[r],
+            CB_V_RM[r],
+            CB_ET[r],
+            CB_W[r],
+            cams,
+            num_anchors,
+            num_pts,
+            pp,
+            num_groups,
+            stick,
+            c_tiles,
+            ex_row,
+            grid_row,
+            *(int(v.shape[1]) for v in values),
+            *(int(v.shape[2]) for v in values),
+            CB_ACC,
+            NUM_READERS,
+            r,
+        ] + accessor_ct
+
+    compute_ct = [CB_V_RM[0], CB_V, CB_ET[0], CB_W[0], CB_A, CB_ACC, c_tiles, CB_A_T]
+    compute_ct += [CB_V_RM[1], CB_ET[1], CB_W[1]]
+
+    reader_rt, compute_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     total = 0
     for first, core in enumerate(cores):
         count = len(range(first, num_anchors, num_cores))
@@ -117,8 +132,8 @@ def deformable_aggregation_fused(
             first,
             count,
             num_cores,
+            output.buffer_address(),
         ]
-        writer_rt[core.x][core.y] = [output.buffer_address(), first, count, num_cores]
         compute_rt[core.x][core.y] = [count]
         total += count
     assert total == num_anchors
@@ -141,8 +156,22 @@ def deformable_aggregation_fused(
     )
     program = ttnn.ProgramDescriptor(
         kernels=[
-            kernel("reader_dfa.cpp", reader_ct, reader_rt, ttnn.ReaderConfigDescriptor()),
-            kernel("writer_dfa.cpp", writer_ct, writer_rt, ttnn.WriterConfigDescriptor()),
+            kernel(
+                "reader_dfa.cpp",
+                reader_ct(0),
+                reader_rt,
+                ttnn.DataMovementConfigDescriptor(
+                    processor=ttnn.DataMovementProcessor.RISCV_1, noc=ttnn.NOC.RISCV_1_default
+                ),
+            ),
+            kernel(
+                "reader_dfa.cpp",
+                reader_ct(1),
+                reader_rt,
+                ttnn.DataMovementConfigDescriptor(
+                    processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.RISCV_0_default
+                ),
+            ),
             kernel("compute_dfa.cpp", compute_ct, compute_rt, compute_cfg),
         ],
         semaphores=[],

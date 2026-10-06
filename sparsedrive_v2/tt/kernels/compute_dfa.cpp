@@ -24,12 +24,14 @@
 #include "api/compute/pack.h"
 #include "api/compute/reconfig_data_format.h"
 
-constexpr uint32_t cb_v_rm = get_compile_time_arg_val(0);
-constexpr uint32_t cb_v = get_compile_time_arg_val(1);
-constexpr uint32_t cb_et = get_compile_time_arg_val(2);
-constexpr uint32_t cb_w = get_compile_time_arg_val(3);
-constexpr uint32_t cb_a = get_compile_time_arg_val(4);
+// Two readers stream sample tiles of the same anchor through their own V_RM / E / W CBs;
+// their tiles are taken in turn so both keep sampling.
+constexpr uint32_t cb_v_rm_r[2] = {get_compile_time_arg_val(0), get_compile_time_arg_val(8)};
+constexpr uint32_t cb_et_r[2] = {get_compile_time_arg_val(2), get_compile_time_arg_val(9)};
+constexpr uint32_t cb_w_r[2] = {get_compile_time_arg_val(3), get_compile_time_arg_val(10)};
 constexpr uint32_t cb_acc = get_compile_time_arg_val(5);
+constexpr uint32_t cb_v = get_compile_time_arg_val(1);
+constexpr uint32_t cb_a = get_compile_time_arg_val(4);
 constexpr uint32_t c_tiles = get_compile_time_arg_val(6);
 constexpr uint32_t cb_a_t = get_compile_time_arg_val(7);  // A before the transpose
 
@@ -38,13 +40,18 @@ constexpr uint32_t LAST_FLAG_WORD = 128;  // W tile, face 1, element 0 (see read
 void kernel_main() {
     const uint32_t num_anchors = get_arg_val<uint32_t>(0);
 
-    compute_kernel_hw_startup(cb_et, cb_w, cb_a);
+    compute_kernel_hw_startup(cb_et_r[0], cb_w_r[0], cb_a);
 
     for (uint32_t a = 0; a < num_anchors; ++a) {
         cb_reserve_back(cb_acc, c_tiles);
         bool first = true;
-        uint32_t last = 0;
-        while (last == 0) {
+        bool done[2] = {false, false};
+        uint32_t r = 1;
+        while (!(done[0] && done[1])) {
+            r = done[r ^ 1] ? r : r ^ 1;
+            const uint32_t cb_v_rm = cb_v_rm_r[r];
+            const uint32_t cb_et = cb_et_r[r];
+            const uint32_t cb_w = cb_w_r[r];
             cb_wait_front(cb_v_rm, c_tiles);
             cb_reserve_back(cb_v, c_tiles);
             // The packer was last set up for the fp32 ACC; tilize_init does not undo that.
@@ -57,7 +64,7 @@ void kernel_main() {
 
             cb_wait_front(cb_et, 1);
             cb_wait_front(cb_w, 1);
-            last = read_tile_value(cb_w, 0, LAST_FLAG_WORD);
+            done[r] = read_tile_value(cb_w, 0, LAST_FLAG_WORD) != 0;
             cb_reserve_back(cb_a_t, 1);
             mul_bcast_cols_init(cb_et, cb_w);
             pack_reconfig_data_format(cb_a_t);

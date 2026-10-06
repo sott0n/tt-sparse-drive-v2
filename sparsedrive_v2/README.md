@@ -24,7 +24,7 @@ Files:
 - `tt/ttnn_backbone.py` — ResNet-34 + FPN.
 - `tt/ttnn_dfa.py` — deformable feature aggregation: projection, masked softmax weights,
   then the fused aggregation below.
-- `tt/ttnn_dfa_fused.py` + `tt/kernels/{reader,compute,writer}_dfa.cpp` — fused sample +
+- `tt/ttnn_dfa_fused.py` + `tt/kernels/{reader,compute}_dfa.cpp` — fused sample +
   weight + reduce in one `ttnn.generic_op`; samples never go to DRAM.
 - `tt/ttnn_sparsedrive_v2.py` — decoder layers, on-device top-k / gather, trajectory composition.
 - `common.py` — asset paths and the sample input.
@@ -91,8 +91,8 @@ Blackhole p300c (one chip), batch 1, warm program cache
 
 | Mode | Throughput (frames pipelined) | Single-frame latency |
 |---|---|---|
-| eager | 54 ms (18.7 FPS) | 57 ms |
-| traced (`TracedSparseDriveV2`) | 53 ms (18.8 FPS) | 55 ms |
+| eager | 46 ms (22.0 FPS) | 49 ms |
+| traced (`TracedSparseDriveV2`) | 45 ms (22.0 FPS) | 47 ms |
 
 The forward is device-bound, so tracing barely changes the time. The decoder
 dispatches far faster than the device runs it. The input pipeline costs ~4 ms:
@@ -102,12 +102,12 @@ padding for the stem conv run on device.
 Device kernel time per stage, from the device profiler
 (`tests/perf/test_profile_forward.py`, warm iteration):
 
-| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation | Fused tuning |
-|---|---|---|---|---|---|
-| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms | 7 ms |
-| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms | 36 ms |
-| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms | 10 ms |
-| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** | **53 ms** |
+| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation | Fused tuning | Two readers |
+|---|---|---|---|---|---|---|
+| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms |
+| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms | 36 ms | 29 ms |
+| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms | 10 ms | 9 ms |
+| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** | **53 ms** | **45 ms** |
 
 What changed, in order:
 
@@ -138,7 +138,11 @@ What changed, in order:
   at 1.7x the median. A sample's 8 group weights are contiguous in `ex` and in the E tile,
   so the reader copies four words per sample instead of eight strided half-words. The
   sampling grid is passed as `[x row | y row]`, built with one concat + untilize instead of
-  interleaving `(x, y)` per point. The layer-0 path DFA is 19 ms in one call.
+  interleaving `(x, y)` per point.
+- **Two readers** — NCRISC and BRISC each sample every other key point of an anchor, and
+  compute takes their tiles in turn. The reader was the bound; giving each reader whole
+  anchors made them wait on each other through compute's anchor order. The layer-0 path
+  DFA is 12.6 ms; each reader spends ~30% of it waiting on NoC reads.
 
 To profile:
 

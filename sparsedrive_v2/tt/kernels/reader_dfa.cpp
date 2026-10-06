@@ -14,6 +14,12 @@
 //
 // The anchor's last sample tile carries LAST_FLAG = 1 in W's face 1 (outside column 0, which
 // is all the column broadcast reads); compute reads it to know where the anchor ends.
+//
+// Two instances run per core (NCRISC and BRISC) on the same anchors, each on every other key
+// point and with its own CBs, so both sample at once; compute interleaves their tiles. The
+// first instance also writes the results: row t of ACC tile t (fp32) holds channels
+// 32t..32t+31. That write is deferred until the next anchor is queued, so waiting on compute
+// does not stall sampling.
 
 #include <stdint.h>
 #include "api/compile_time_args.h"
@@ -51,12 +57,17 @@ constexpr uint32_t level_w[num_levels] = {
     get_compile_time_arg_val(20),
     get_compile_time_arg_val(21)};
 
-constexpr auto ex_args = TensorAccessorArgs<22>();
+constexpr uint32_t cb_acc = get_compile_time_arg_val(22);
+constexpr uint32_t num_readers = get_compile_time_arg_val(23);
+constexpr uint32_t reader_id = get_compile_time_arg_val(24);
+
+constexpr auto ex_args = TensorAccessorArgs<25>();
 constexpr auto grid_args = TensorAccessorArgs<ex_args.next_compile_time_args_offset()>();
 constexpr auto v0_args = TensorAccessorArgs<grid_args.next_compile_time_args_offset()>();
 constexpr auto v1_args = TensorAccessorArgs<v0_args.next_compile_time_args_offset()>();
 constexpr auto v2_args = TensorAccessorArgs<v1_args.next_compile_time_args_offset()>();
 constexpr auto v3_args = TensorAccessorArgs<v2_args.next_compile_time_args_offset()>();
+constexpr auto out_args = TensorAccessorArgs<v3_args.next_compile_time_args_offset()>();
 
 static_assert(num_groups == 8, "a sample's group weights are written as four 32-bit words");
 
@@ -65,6 +76,28 @@ constexpr uint32_t LAST_FLAG_OFFSET = 512;  // face 1, element 0
 
 // Byte offset of bf16 element (row, col < 16) in a 32x32 tile: faces 0 / 2 hold columns 0-15.
 inline uint32_t row_offset(uint32_t row) { return (row >= 16 ? 1024 : 0) + ((row & 15) << 5); }
+
+constexpr uint32_t ACC_TILE_NBYTES = 4096;  // fp32 32x32
+constexpr uint32_t ACC_FACE_NBYTES = 1024;  // fp32 16x16
+constexpr uint32_t HALF_ROW_NBYTES = 64;    // 16 fp32
+
+template <typename Accessor>
+inline void write_anchor(Noc& noc, DataflowBuffer& acc_dfb, const Accessor& out, uint32_t a) {
+    acc_dfb.wait_front(c_tiles);
+    for (uint32_t t = 0; t < c_tiles; ++t) {
+        const uint32_t row = t * ACC_TILE_NBYTES + t * HALF_ROW_NBYTES;
+        const uint32_t col = t * 2 * HALF_ROW_NBYTES;
+        noc.async_write(acc_dfb, out, HALF_ROW_NBYTES, {.offset_bytes = row}, {.page_id = a, .offset_bytes = col});
+        noc.async_write(
+            acc_dfb,
+            out,
+            HALF_ROW_NBYTES,
+            {.offset_bytes = row + ACC_FACE_NBYTES},
+            {.page_id = a, .offset_bytes = col + HALF_ROW_NBYTES});
+    }
+    noc.async_write_barrier();
+    acc_dfb.pop_front(c_tiles);
+}
 
 inline void clear_rows(uint32_t e_l1, uint32_t w_l1, uint32_t first_row) {
     for (uint32_t s = first_row; s < TILE_ROWS; ++s) {
@@ -84,6 +117,7 @@ void kernel_main() {
     const uint32_t anchor_first = get_arg_val<uint32_t>(6);
     const uint32_t anchor_count = get_arg_val<uint32_t>(7);
     const uint32_t anchor_stride = get_arg_val<uint32_t>(8);
+    const uint32_t out_addr = get_arg_val<uint32_t>(9);
 
     const auto ex_acc = TensorAccessor(ex_args, ex_addr);
     const auto grid_acc = TensorAccessor(grid_args, grid_addr);
@@ -91,12 +125,14 @@ void kernel_main() {
     const auto v1 = TensorAccessor(v1_args, value_addr[1]);
     const auto v2 = TensorAccessor(v2_args, value_addr[2]);
     const auto v3 = TensorAccessor(v3_args, value_addr[3]);
+    const auto out = TensorAccessor(out_args, out_addr);
 
     DataflowBuffer ex_dfb(cb_ex);
     DataflowBuffer grid_dfb(cb_grid);
     DataflowBuffer v_dfb(cb_v_rm);
     DataflowBuffer et_dfb(cb_et);
     DataflowBuffer w_dfb(cb_w);
+    DataflowBuffer acc_dfb(cb_acc);
     Noc noc;
 
     // Scratch arenas: reserved once, never pushed.
@@ -111,6 +147,8 @@ void kernel_main() {
     zero_out_tiles<cb_et>(noc, et_dfb);
     zero_out_tiles<cb_w>(noc, w_dfb);
 
+    bool pending = false;
+    uint32_t pending_anchor = 0;
     for (uint32_t i = 0; i < anchor_count; ++i) {
         const uint32_t a = anchor_first + i * anchor_stride;
         for (uint32_t c = 0; c < num_cams; ++c) {
@@ -132,7 +170,7 @@ void kernel_main() {
             volatile tt_l1_ptr uint32_t* grid =
                 reinterpret_cast<volatile tt_l1_ptr uint32_t*>(grid_l1 + c * grid_row_nbytes);
             const uint32_t ex_cam_l1 = ex_l1 + c * ex_row_nbytes;
-            for (uint32_t p = 0; p < num_pts; ++p) {
+            for (uint32_t p = reader_id; p < num_pts; p += num_readers) {
                 // grid row layout: [x of every point | y of every point]
                 const int32_t gx = fp32_to_q16(grid[p]);
                 const int32_t gy = fp32_to_q16(grid[num_pts_padded + p]);
@@ -216,5 +254,14 @@ void kernel_main() {
         v_dfb.push_back(c_tiles);
         et_dfb.push_back(1);
         w_dfb.push_back(1);
+
+        if (pending) {
+            write_anchor(noc, acc_dfb, out, pending_anchor);
+        }
+        pending = reader_id == 0;
+        pending_anchor = a;
+    }
+    if (pending) {
+        write_anchor(noc, acc_dfb, out, pending_anchor);
     }
 }
