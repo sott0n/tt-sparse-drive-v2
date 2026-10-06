@@ -91,8 +91,8 @@ Blackhole p300c (one chip), batch 1, warm program cache
 
 | Mode | Throughput (frames pipelined) | Single-frame latency |
 |---|---|---|
-| eager | 46 ms (22.0 FPS) | 49 ms |
-| traced (`TracedSparseDriveV2`) | 45 ms (22.0 FPS) | 47 ms |
+| eager | 38 ms (26.4 FPS) | 41 ms |
+| traced (`TracedSparseDriveV2`) | 38 ms (26.7 FPS) | 39 ms |
 
 The forward is device-bound, so tracing barely changes the time. The decoder
 dispatches far faster than the device runs it. The input pipeline costs ~4 ms:
@@ -102,12 +102,12 @@ padding for the stem conv run on device.
 Device kernel time per stage, from the device profiler
 (`tests/perf/test_profile_forward.py`, warm iteration):
 
-| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation | Fused tuning | Two readers |
-|---|---|---|---|---|---|---|
-| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms |
-| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms | 36 ms | 29 ms |
-| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms | 10 ms | 9 ms |
-| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** | **53 ms** | **45 ms** |
+| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation | Fused tuning | Two readers | Features in L1 |
+|---|---|---|---|---|---|---|---|
+| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 8 ms |
+| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms | 36 ms | 29 ms | 22 ms |
+| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms | 10 ms | 9 ms | 8 ms |
+| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** | **53 ms** | **45 ms** | **37 ms** |
 
 What changed, in order:
 
@@ -143,6 +143,9 @@ What changed, in order:
   compute takes their tiles in turn. The reader was the bound; giving each reader whole
   anchors made them wait on each other through compute's anchor order. The layer-0 path
   DFA is 12.6 ms; each reader spends ~30% of it waiting on NoC reads.
+- **Features in L1** — the DFA reads ~480 GB/s of feature sticks from DRAM, its bandwidth
+  limit, while the four FPN levels are only ~17 MB. They are now kept L1-interleaved for
+  the decoder. The layer-0 path DFA is 5.3 ms.
 
 To profile:
 
