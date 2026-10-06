@@ -8,7 +8,7 @@ Replaces upstream's CUDA ``deformable_aggregation`` with on-device ops, per anch
   key points   X, Y = anchor_xy + learnable_fc(query)          (1, n, Pp) fp32
   projection   u, v, d = P[cam] @ [X, Y, z, 1]  (elementwise)  (cams, n, Pp) fp32
   weights      exp(weights_fc(query + camera_embed)) masked     (cams, n, G*L*Pp) fp32
-  sampling     grid_sample per level                           (cams, n, Pp, C)
+  sampling     fixed-point grid_sample per level (ttnn_grid_sample) (cams, n, Pp, C)
   reduction    batched matmul  w_l (cams, n, G, Pp) @ S_l (cams, n, Pp, C)
                -> sum over cams -> keep group g's channel block of row g
   normalize    divide by the per-group softmax denominator     (1, n, C)
@@ -25,6 +25,7 @@ from typing import Dict, List
 import torch
 
 import ttnn
+from models.experimental.sparsedrive_v2.tt.ttnn_grid_sample import grid_sample_fixed_point
 from models.experimental.sparsedrive_v2.tt.ttnn_ops import ACT_DTYPE, TtLayerNorm, TtLinear, to_device
 
 PAD_LOGIT = -30000.0
@@ -220,7 +221,7 @@ class TtDeformableFeatureAggregation:
 
         acc = None
         for lvl in range(L):
-            sampled = ttnn.to_layout(ttnn.grid_sample(values[lvl], grid), ttnn.TILE_LAYOUT)  # (cams, n, Pp, C)
+            sampled = ttnn.to_layout(grid_sample_fixed_point(values[lvl], grid), ttnn.TILE_LAYOUT)  # (cams, n, Pp, C)
             r = ttnn.matmul(
                 ex[:, :, :, lvl * Pp : (lvl + 1) * Pp],
                 sampled,

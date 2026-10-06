@@ -23,7 +23,10 @@ Files:
   `deformable_aggregation` is replaced by a torch implementation of the same kernel.
 - `tt/ttnn_backbone.py` — ResNet-34 + FPN.
 - `tt/ttnn_dfa.py` — deformable feature aggregation (projection, masked softmax weights,
-  `ttnn.grid_sample`, batched-matmul reduction).
+  bilinear sampling, batched-matmul reduction).
+- `tt/ttnn_grid_sample.py` + `tt/kernels/reader_grid_sample_fixed_point.cpp` — the bilinear
+  sampler the DFA uses: `ttnn.grid_sample`'s program rebuilt with `ttnn.generic_op`, with a
+  fixed-point reader (see [Performance](#performance)).
 - `tt/ttnn_sparsedrive_v2.py` — decoder layers, on-device top-k / gather, trajectory composition.
 - `common.py` — asset paths and the sample input.
 
@@ -51,6 +54,7 @@ benchmark.
 
 ```bash
 pytest models/experimental/sparsedrive_v2/tests/pcc/test_backbone.py      # ResNet-34 + FPN
+pytest models/experimental/sparsedrive_v2/tests/pcc/test_grid_sample.py   # fixed-point grid_sample
 pytest models/experimental/sparsedrive_v2/tests/pcc/test_dfa.py           # deformable aggregation
 pytest models/experimental/sparsedrive_v2/tests/pcc/test_sparsedrive_v2.py  # end to end
 pytest models/experimental/sparsedrive_v2/tests/perf/test_perf.py         # eager vs traced latency
@@ -88,37 +92,45 @@ Blackhole p300c (one chip), batch 1, warm program cache
 
 | Mode | Throughput (frames pipelined) | Single-frame latency |
 |---|---|---|
-| eager | 237 ms (4.2 FPS) | 241 ms |
-| traced (`TracedSparseDriveV2`) | 236 ms (4.2 FPS) | 238 ms |
+| eager | 157 ms (6.4 FPS) | 162 ms |
+| traced (`TracedSparseDriveV2`) | 157 ms (6.4 FPS) | 159 ms |
 
 The forward is device-bound, so tracing barely changes the time. The decoder
 dispatches far faster than the device runs it. The input pipeline costs ~4 ms:
 images are uploaded as 3-channel NCHW bf16, and the NHWC permute plus the channel
-padding for the stem conv run on device. Padding on the host and uploading 16
-channels took ~21 ms.
+padding for the stem conv run on device.
 
 Device kernel time per stage, from the device profiler
 (`tests/perf/test_profile_forward.py`, warm iteration):
 
-| Stage | Ops | Device time (before tuning) |
-|---|---|---|
-| Backbone + FPN | 322 | 5 ms |
-| Decoder layer 0 | 591 | 254 ms |
-| Decoder layer 1 | 573 | 62 ms |
+| Stage | First port | After matmul/layout tuning | After fixed-point grid_sample |
+|---|---|---|---|
+| Backbone + FPN | 5 ms | 7 ms | 7 ms |
+| Decoder layer 0 | 254 ms | 185 ms | 120 ms |
+| Decoder layer 1 | 62 ms | 43 ms | 29 ms |
+| **Total** | **321 ms** | **235 ms** | **156 ms** |
 
-Tuning applied after profiling:
+What changed, in order:
 
-- The DFA's batched reduction matmul now uses an explicit program config. The auto
-  config ran it on 8 of 110 cores; the change cut that matmul from ~5 ms to ~1.3 ms per call.
-- `grid_sample` no longer uses grid batching, which removes a row-major reshape copy of
-  every sampled tensor.
-- The sampling grid is built with concat + transpose instead of `stack`.
+- **DFA reduction matmul** — an explicit program config. The auto config ran it on 8 of
+  110 cores; the change cut it from ~5 ms to ~1.3 ms per call.
+- **Grid build** — the sampling grid is built with concat + transpose instead of `stack`.
+  Dropping `grid_sample`'s grid batching was measured as a wash: it removed a 17 ms
+  reshape copy, but plain `grid_sample` was ~17 ms slower.
+- **Fixed-point grid_sample** (`tt/ttnn_grid_sample.py`) — 128 ms -> 49 ms in total.
+  Accumulating profiler zones placed inside `ttnn.grid_sample`'s kernels showed the op is
+  reader-bound. ~60% of the reader's time went to the per-point sampling geometry. The
+  data-movement cores have no FPU, so every float op compiles to a software routine
+  (`__mulsf3`, `__addsf3`, ... in the ELF). The replacement reader does the same geometry
+  in Q16.16 integers, as ttnn's `multi_scale_deformable_attn` reader does (#55133), and
+  fetches grid sticks 16 at a time behind one barrier. Compute and writer are ttnn's own
+  kernels, unchanged. On the layer-0 shape it runs 2.5x faster at the same PCC against
+  torch (0.999993).
 
-The dominant remaining cost is `grid_sample` (~90 ms in layer 0), which samples
-512k key points x 3 cameras x 4 levels, together with tilizing its output. The next
-step is a fused deformable-aggregation op. It would sample, weight and accumulate in
-one kernel without materializing the samples, and it would skip cameras a point does
-not project into, as upstream's CUDA kernel does.
+What remains: tilizing the sampled tensor (24 ms), the reduction matmuls (22 ms) and
+reshapes (16 ms). All three exist only because the samples are materialized in DRAM.
+A fused deformable-aggregation op that samples and accumulates in one kernel would
+remove them.
 
 To profile:
 
