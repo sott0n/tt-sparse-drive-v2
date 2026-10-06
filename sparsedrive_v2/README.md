@@ -91,8 +91,8 @@ Blackhole p300c (one chip), batch 1, warm program cache
 
 | Mode | Throughput (frames pipelined) | Single-frame latency |
 |---|---|---|
-| eager | 78 ms (12.8 FPS) | 82 ms |
-| traced (`TracedSparseDriveV2`) | 78 ms (12.8 FPS) | 80 ms |
+| eager | 54 ms (18.7 FPS) | 57 ms |
+| traced (`TracedSparseDriveV2`) | 53 ms (18.8 FPS) | 55 ms |
 
 The forward is device-bound, so tracing barely changes the time. The decoder
 dispatches far faster than the device runs it. The input pipeline costs ~4 ms:
@@ -102,12 +102,12 @@ padding for the stem conv run on device.
 Device kernel time per stage, from the device profiler
 (`tests/perf/test_profile_forward.py`, warm iteration):
 
-| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation |
-|---|---|---|---|---|
-| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms |
-| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms |
-| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms |
-| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** |
+| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation | Fused tuning |
+|---|---|---|---|---|---|
+| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms | 7 ms |
+| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms | 36 ms |
+| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms | 10 ms |
+| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** | **53 ms** |
 
 What changed, in order:
 
@@ -132,7 +132,13 @@ What changed, in order:
   projection misses every image are not read: that is 69% of them at layer 0. Every 32
   kept samples become one tile. Compute forms `A = softmax weight (group x sample) *
   bilinear weight` and accumulates `A @ V` per 32-channel group in fp32 L1. The layer-0
-  path DFA is 26 ms in four calls. PCC against a torch reference of the same sum is 0.999996.
+  PCC against a torch reference of the same sum is 0.999996.
+- **Fused tuning** — anchors go to cores strided (`i, i + cores, ...`) in one call per DFA.
+  Visible-sample counts vary per anchor, and contiguous 2-3-anchor blocks left one core
+  at 1.7x the median. A sample's 8 group weights are contiguous in `ex` and in the E tile,
+  so the reader copies four words per sample instead of eight strided half-words. The
+  sampling grid is passed as `[x row | y row]`, built with one concat + untilize instead of
+  interleaving `(x, y)` per point. The layer-0 path DFA is 19 ms in one call.
 
 To profile:
 

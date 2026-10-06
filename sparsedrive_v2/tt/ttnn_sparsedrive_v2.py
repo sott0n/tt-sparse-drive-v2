@@ -41,7 +41,7 @@ from models.experimental.sparsedrive_v2.tt.ttnn_ops import (
     to_device,
 )
 
-DFA_CHUNK = 256
+DFA_CHUNK = 1024
 
 
 class HiLoTable:

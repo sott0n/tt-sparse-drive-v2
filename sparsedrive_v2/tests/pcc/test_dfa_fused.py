@@ -48,8 +48,8 @@ def test_dfa_fused(device, num_anchors, pp, num_pts, sizes):
 
     out = deformable_aggregation_fused(
         [rm(v, ttnn.bfloat16) for v in values],
-        rm(grid.reshape(cams, num_anchors, pp * 2), ttnn.float32),
-        rm(ex.reshape(cams, num_anchors, -1), ttnn.bfloat16),
+        rm(grid.permute(0, 1, 3, 2).reshape(cams, num_anchors, 2 * pp), ttnn.float32),
+        rm(ex.permute(0, 1, 4, 3, 2).reshape(cams, num_anchors, -1), ttnn.bfloat16),
         num_pts,
         groups,
     )

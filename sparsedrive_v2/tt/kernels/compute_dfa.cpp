@@ -6,7 +6,7 @@
 //
 // Per sample tile (32 samples of one anchor, see reader_dfa.cpp):
 //   V   = tilize(V_RM)                        32 samples x C, as c_tiles tiles
-//   A   = ET * W (row broadcast)              row g = group-g weight x bilinear weight
+//   A   = transpose(E * W (column broadcast))  row g = group-g weight x bilinear weight
 //   ACC[t] += A @ V[t]   for each channel tile t
 // Row g of ACC[t] is the group-g sum over the anchor's samples for channels 32t..32t+31;
 // only row t (group t == channel tile t, 32 channels per group) is meaningful. ACC lives in
@@ -20,6 +20,7 @@
 #include "api/compute/tilize.h"
 #include "api/compute/bcast.h"
 #include "api/compute/matmul.h"
+#include "api/compute/transpose.h"
 #include "api/compute/pack.h"
 #include "api/compute/reconfig_data_format.h"
 
@@ -30,8 +31,9 @@ constexpr uint32_t cb_w = get_compile_time_arg_val(3);
 constexpr uint32_t cb_a = get_compile_time_arg_val(4);
 constexpr uint32_t cb_acc = get_compile_time_arg_val(5);
 constexpr uint32_t c_tiles = get_compile_time_arg_val(6);
+constexpr uint32_t cb_a_t = get_compile_time_arg_val(7);  // A before the transpose
 
-constexpr uint32_t LAST_FLAG_WORD = 256;  // W tile, face 2, element 0 (see reader_dfa.cpp)
+constexpr uint32_t LAST_FLAG_WORD = 128;  // W tile, face 1, element 0 (see reader_dfa.cpp)
 
 void kernel_main() {
     const uint32_t num_anchors = get_arg_val<uint32_t>(0);
@@ -56,18 +58,31 @@ void kernel_main() {
             cb_wait_front(cb_et, 1);
             cb_wait_front(cb_w, 1);
             last = read_tile_value(cb_w, 0, LAST_FLAG_WORD);
+            cb_reserve_back(cb_a_t, 1);
+            mul_bcast_cols_init(cb_et, cb_w);
+            pack_reconfig_data_format(cb_a_t);
+            tile_regs_acquire();
+            mul_tiles_bcast_cols(cb_et, cb_w, 0, 0, 0);
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_tile(0, cb_a_t);
+            tile_regs_release();
+            cb_push_back(cb_a_t, 1);
+            cb_pop_front(cb_et, 1);
+            cb_pop_front(cb_w, 1);
+
+            cb_wait_front(cb_a_t, 1);
             cb_reserve_back(cb_a, 1);
-            mul_bcast_rows_init(cb_et, cb_w);
+            transpose_init(cb_a_t);
             pack_reconfig_data_format(cb_a);
             tile_regs_acquire();
-            mul_tiles_bcast_rows(cb_et, cb_w, 0, 0, 0);
+            transpose_tile(cb_a_t, 0, 0);
             tile_regs_commit();
             tile_regs_wait();
             pack_tile(0, cb_a);
             tile_regs_release();
             cb_push_back(cb_a, 1);
-            cb_pop_front(cb_et, 1);
-            cb_pop_front(cb_w, 1);
+            cb_pop_front(cb_a_t, 1);
 
             cb_wait_front(cb_a, 1);
             cb_wait_front(cb_v, c_tiles);

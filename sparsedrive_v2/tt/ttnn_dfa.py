@@ -7,7 +7,7 @@ Replaces upstream's CUDA ``deformable_aggregation`` with on-device ops, per anch
 
   key points   X, Y = anchor_xy + learnable_fc(query)          (1, n, Pp) fp32
   projection   u, v, d = P[cam] @ [X, Y, z, 1]  (elementwise)  (cams, n, Pp) fp32
-  weights      exp(weights_fc(query + camera_embed)) masked     (cams, n, G*L*Pp) fp32
+  weights      exp(weights_fc(query + camera_embed)) masked     (cams, n, Pp*L*G) fp32
   aggregate    fused sample + weight + reduce (ttnn_dfa_fused)  (n, C) fp32
   normalize    divide by the per-group softmax denominator     (1, n, C)
 
@@ -97,13 +97,14 @@ class TtDeformableFeatureAggregation:
         bk[: self.P], bk[self.Pp : self.Pp + self.P] = b[0::2], b[1::2]
         self.kps_fc = TtLinear(device, wk, bk)
 
-        # weights_fc rows are (level, point, group); regroup into (group, level, Pp).
+        # weights_fc rows are (level, point, group); regroup into (Pp, level, group) so the fused
+        # kernel reads a sample's G group weights contiguously.
         w, b = ref.weights_fc.weight.detach(), ref.weights_fc.bias.detach()
-        w = w.view(self.L, self.P, self.G, -1).permute(2, 0, 1, 3)
-        b = b.view(self.L, self.P, self.G).permute(2, 0, 1)
-        wf = torch.zeros(self.G, self.L, self.Pp, w.shape[-1])
-        bf = torch.full((self.G, self.L, self.Pp), PAD_LOGIT)
-        wf[:, :, : self.P], bf[:, :, : self.P] = w, b
+        w = w.view(self.L, self.P, self.G, -1).permute(1, 0, 2, 3)
+        b = b.view(self.L, self.P, self.G).permute(1, 0, 2)
+        wf = torch.zeros(self.Pp, self.L, self.G, w.shape[-1])
+        bf = torch.full((self.Pp, self.L, self.G), PAD_LOGIT)
+        wf[: self.P], bf[: self.P] = w, b
         self.weights_fc = TtLinear(device, wf.reshape(-1, w.shape[-1]), bf.reshape(-1))
 
         enc = ref.camera_encoder
@@ -116,9 +117,9 @@ class TtDeformableFeatureAggregation:
         for g in range(self.G):
             mask[g, g * gd : (g + 1) * gd] = 1
         self.group_expand = to_device(mask, device, ttnn.float32)  # (G, C)
-        # column j of the (G, L, Pp)-ordered logits belongs to group j // (L * Pp)
-        seg = torch.zeros(self.G * self.L * self.Pp, self.G)
-        seg[torch.arange(seg.shape[0]), torch.arange(seg.shape[0]) // (self.L * self.Pp)] = 1
+        # column j of the (Pp, L, G)-ordered logits belongs to group j % G
+        seg = torch.zeros(self.Pp * self.L * self.G, self.G)
+        seg[torch.arange(seg.shape[0]), torch.arange(seg.shape[0]) % self.G] = 1
         self.group_sum = to_device(seg, device, ttnn.float32)
 
         grid = device.compute_with_storage_grid_size()
@@ -187,9 +188,9 @@ class TtDeformableFeatureAggregation:
         # Unnormalized softmax weights over (cams, levels, points) per (anchor, group).  One shift
         # per anchor is enough: per-group maxima of the released weights differ by < 6.
         feat = ttnn.add(ttnn.repeat(query, (cams, 1, 1)), frame["cam_embed"])
-        logits = self.weights_fc(feat, dtype=ttnn.float32)  # (cams, n, G*L*Pp)
+        logits = self.weights_fc(feat, dtype=ttnn.float32)  # (cams, n, Pp*L*G)
         shift = ttnn.max(ttnn.max(logits, dim=-1, keepdim=True), dim=0, keepdim=True)
-        ex = ttnn.multiply(ttnn.exp(ttnn.subtract(logits, shift)), ttnn.repeat(keep, (1, 1, G * L)))
+        ex = ttnn.multiply(ttnn.exp(ttnn.subtract(logits, shift)), ttnn.repeat_interleave(keep, L * G, dim=-1))
         den = ttnn.matmul(ex, self.group_sum, compute_kernel_config=self.kps_fc.cfg, core_grid=self.core_grid)
         den = ttnn.sum(den, dim=0, keepdim=True)
         ex = ttnn.to_layout(ttnn.typecast(ex, ttnn.bfloat16), ttnn.ROW_MAJOR_LAYOUT)
@@ -198,12 +199,9 @@ class TtDeformableFeatureAggregation:
         # inside the image; those points go far outside, where the fused kernel skips them.
         def to_grid(t):
             t = ttnn.clamp(ttnn.subtract(ttnn.multiply(t, 2.0), 1.0), min=-1.5, max=1.5)
-            t = ttnn.add(ttnn.multiply(t, valid), ttnn.multiply(ttnn.subtract(valid, 1.0), 3.0))
-            return ttnn.reshape(t, (cams, n, 1, Pp))
+            return ttnn.add(ttnn.multiply(t, valid), ttnn.multiply(ttnn.subtract(valid, 1.0), 3.0))
 
-        # interleave (x, y) per point: (cams, n, 2, Pp) -> (cams, n, Pp, 2)
-        grid = ttnn.transpose(ttnn.concat([to_grid(x), to_grid(y)], dim=2), -2, -1)
-        grid = ttnn.reshape(ttnn.to_layout(grid, ttnn.ROW_MAJOR_LAYOUT), (cams, n, Pp * 2))
+        grid = ttnn.to_layout(ttnn.concat([to_grid(x), to_grid(y)], dim=-1), ttnn.ROW_MAJOR_LAYOUT)  # (cams, n, 2*Pp)
 
         acc = deformable_aggregation_fused(values, grid, ex, self.P, G)  # (n, C)
         acc = ttnn.reshape(ttnn.to_layout(acc, ttnn.TILE_LAYOUT), (1, n, C))

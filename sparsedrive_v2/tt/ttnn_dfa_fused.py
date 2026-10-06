@@ -4,7 +4,7 @@
 """Fused deformable aggregation (sample + weight + reduce in one ``ttnn.generic_op``).
 
     out[a, g*32 + i] = sum over (cam, level, point, corner) inside the image of
-                       ex[cam, a, g, level, point] * bilinear_w * value[cam, level][corner, g*32 + i]
+                       ex[cam, a, point, level, g] * bilinear_w * value[cam, level][corner, g*32 + i]
 
 Unnormalized: the caller divides by the softmax denominator. Samples never go to DRAM;
 see ``kernels/reader_dfa.cpp`` and ``kernels/compute_dfa.cpp`` for the tile scheme.
@@ -22,7 +22,7 @@ TILE_HW, TILE_WIDTH = 1024, 32
 NUM_LEVELS = 4
 MAX_SPATIAL = 8192  # keeps the reader's Q16.16 pixel math inside int32
 
-CB_EX, CB_GRID, CB_V_RM, CB_V, CB_ET, CB_W, CB_A, CB_ACC = range(8)
+CB_EX, CB_GRID, CB_V_RM, CB_V, CB_ET, CB_W, CB_A, CB_ACC, CB_A_T = range(9)
 
 
 def _cb(index, dtype, page_size, num_pages, cores):
@@ -36,10 +36,10 @@ def deformable_aggregation_fused(
     """
     Args:
         values: per level (cams, H_l, W_l, C) bf16 row-major.
-        grid: (cams, A, Pp * 2) fp32 row-major, (x, y) per key point in [-1, 1]; points to skip
-            (outside the image or masked) must lie outside (-1, 1).
-        ex: (cams, A, G * L * Pp) bf16 row-major, unnormalized softmax weights ordered
-            (group, level, point).
+        grid: (cams, A, 2 * Pp) fp32 row-major, [x of every key point | y of every key point]
+            in [-1, 1]; points to skip (outside the image or masked) must lie outside (-1, 1).
+        ex: (cams, A, Pp * L * G) bf16 row-major, unnormalized softmax weights ordered
+            (point, level, group).
         num_pts: real key points per anchor (<= Pp).
     Returns:
         (A, C) fp32 row-major.
@@ -68,7 +68,7 @@ def deformable_aggregation_fused(
     stick = values[0].buffer_aligned_page_size()
 
     grid_size = device.compute_with_storage_grid_size()
-    num_cores, all_cores, group_1, group_2, per_1, per_2 = ttnn.split_work_to_cores(grid_size, num_anchors)
+    num_cores, all_cores, _, _, _, _ = ttnn.split_work_to_cores(grid_size, num_anchors)
     cores = ttnn.corerange_to_cores(all_cores, num_cores, True)
 
     cbs = [
@@ -79,6 +79,7 @@ def deformable_aggregation_fused(
         _cb(CB_ET, ttnn.bfloat16, TILE_HW * 2, 2, all_cores),
         _cb(CB_W, ttnn.bfloat16, TILE_HW * 2, 2, all_cores),
         _cb(CB_A, ttnn.bfloat16, TILE_HW * 2, 2, all_cores),
+        _cb(CB_A_T, ttnn.bfloat16, TILE_HW * 2, 2, all_cores),
         _cb(CB_ACC, ttnn.float32, TILE_HW * 4, 2 * c_tiles, all_cores),
     ]
 
@@ -103,23 +104,24 @@ def deformable_aggregation_fused(
     for t in (ex, grid, *values):
         reader_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
     writer_ct = [CB_ACC, c_tiles] + ttnn.TensorAccessorArgs(output).get_compile_time_args()
-    compute_ct = [CB_V_RM, CB_V, CB_ET, CB_W, CB_A, CB_ACC, c_tiles]
+    compute_ct = [CB_V_RM, CB_V, CB_ET, CB_W, CB_A, CB_ACC, c_tiles, CB_A_T]
 
     reader_rt, writer_rt, compute_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
-    start = 0
-    for core in cores:
-        count = per_1 if group_1.contains(core) else per_2
+    total = 0
+    for first, core in enumerate(cores):
+        count = len(range(first, num_anchors, num_cores))
         reader_rt[core.x][core.y] = [
             ex.buffer_address(),
             grid.buffer_address(),
             *(v.buffer_address() for v in values),
-            start,
+            first,
             count,
+            num_cores,
         ]
-        writer_rt[core.x][core.y] = [output.buffer_address(), start, count]
+        writer_rt[core.x][core.y] = [output.buffer_address(), first, count, num_cores]
         compute_rt[core.x][core.y] = [count]
-        start += count
-    assert start == num_anchors
+        total += count
+    assert total == num_anchors
 
     def kernel(name, ct, rt, config):
         return ttnn.KernelDescriptor(

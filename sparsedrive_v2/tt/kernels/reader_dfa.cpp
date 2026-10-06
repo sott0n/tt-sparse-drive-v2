@@ -7,13 +7,13 @@
 // For each anchor it walks (camera, key point, level, bilinear corner) and keeps only corners
 // that land inside the feature map. Every 32 kept samples form one "sample tile":
 //   V_RM : 32 row-major feature sticks (C channels each)      -> tilized by compute
-//   ET   : tile, row g / column s = softmax weight of group g for sample s
-//   W    : tile, row 0 / column s = bilinear weight of sample s
-// Compute reduces sum_s ET[g, s] * W[s] * V[s, :] per group. Columns past the last kept
-// sample are zero in ET and W, so stale V rows contribute nothing.
+//   E    : tile, row s / column g = softmax weight of group g for sample s
+//   W    : tile, row s / column 0 = bilinear weight of sample s
+// Compute reduces sum_s E[s, g] * W[s] * V[s, :] per group. Rows past the last kept sample
+// are zero in E and W, so stale V rows contribute nothing.
 //
-// The anchor's last sample tile carries LAST_FLAG = 1 in W's face 2 (outside row 0, which is
-// all the row broadcast reads); compute reads it to know where the anchor ends.
+// The anchor's last sample tile carries LAST_FLAG = 1 in W's face 1 (outside column 0, which
+// is all the column broadcast reads); compute reads it to know where the anchor ends.
 
 #include <stdint.h>
 #include "api/compile_time_args.h"
@@ -58,21 +58,19 @@ constexpr auto v1_args = TensorAccessorArgs<v0_args.next_compile_time_args_offse
 constexpr auto v2_args = TensorAccessorArgs<v1_args.next_compile_time_args_offset()>();
 constexpr auto v3_args = TensorAccessorArgs<v2_args.next_compile_time_args_offset()>();
 
+static_assert(num_groups == 8, "a sample's group weights are written as four 32-bit words");
+
 constexpr uint32_t TILE_ROWS = 32;
-constexpr uint32_t FACE_NBYTES = 512;        // 16 x 16 bf16
-constexpr uint32_t LAST_FLAG_OFFSET = 1024;  // face 2, element 0
+constexpr uint32_t LAST_FLAG_OFFSET = 512;  // face 1, element 0
 
-// Byte offset of bf16 element (row < 16, col) in a 32x32 tile.
-inline uint32_t tile_offset(uint32_t row, uint32_t col) {
-    return (col >= 16 ? FACE_NBYTES : 0) + ((row * 16 + (col & 15)) << 1);
-}
+// Byte offset of bf16 element (row, col < 16) in a 32x32 tile: faces 0 / 2 hold columns 0-15.
+inline uint32_t row_offset(uint32_t row) { return (row >= 16 ? 1024 : 0) + ((row & 15) << 5); }
 
-inline void clear_columns(uint32_t et_l1, uint32_t w_l1, uint32_t first_col) {
-    for (uint32_t s = first_col; s < TILE_ROWS; ++s) {
-        for (uint32_t g = 0; g < num_groups; ++g) {
-            *reinterpret_cast<volatile tt_l1_ptr uint16_t*>(et_l1 + tile_offset(g, s)) = 0;
-        }
-        *reinterpret_cast<volatile tt_l1_ptr uint16_t*>(w_l1 + tile_offset(0, s)) = 0;
+inline void clear_rows(uint32_t e_l1, uint32_t w_l1, uint32_t first_row) {
+    for (uint32_t s = first_row; s < TILE_ROWS; ++s) {
+        volatile tt_l1_ptr uint32_t* e = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(e_l1 + row_offset(s));
+        e[0] = e[1] = e[2] = e[3] = 0;
+        *reinterpret_cast<volatile tt_l1_ptr uint16_t*>(w_l1 + row_offset(s)) = 0;
     }
 }
 
@@ -81,8 +79,11 @@ void kernel_main() {
     const uint32_t grid_addr = get_arg_val<uint32_t>(1);
     const uint32_t value_addr[num_levels] = {
         get_arg_val<uint32_t>(2), get_arg_val<uint32_t>(3), get_arg_val<uint32_t>(4), get_arg_val<uint32_t>(5)};
-    const uint32_t anchor_start = get_arg_val<uint32_t>(6);
+    // Anchors first, first + stride, ...: visible-sample counts vary per anchor, and strided
+    // assignment spreads the heavy ones across cores.
+    const uint32_t anchor_first = get_arg_val<uint32_t>(6);
     const uint32_t anchor_count = get_arg_val<uint32_t>(7);
+    const uint32_t anchor_stride = get_arg_val<uint32_t>(8);
 
     const auto ex_acc = TensorAccessor(ex_args, ex_addr);
     const auto grid_acc = TensorAccessor(grid_args, grid_addr);
@@ -110,7 +111,8 @@ void kernel_main() {
     zero_out_tiles<cb_et>(noc, et_dfb);
     zero_out_tiles<cb_w>(noc, w_dfb);
 
-    for (uint32_t a = anchor_start; a < anchor_start + anchor_count; ++a) {
+    for (uint32_t i = 0; i < anchor_count; ++i) {
+        const uint32_t a = anchor_first + i * anchor_stride;
         for (uint32_t c = 0; c < num_cams; ++c) {
             const uint32_t page = c * num_anchors_total + a;
             noc.async_read(ex_acc, ex_dfb, ex_row_nbytes, {.page_id = page}, {.offset_bytes = c * ex_row_nbytes});
@@ -131,8 +133,9 @@ void kernel_main() {
                 reinterpret_cast<volatile tt_l1_ptr uint32_t*>(grid_l1 + c * grid_row_nbytes);
             const uint32_t ex_cam_l1 = ex_l1 + c * ex_row_nbytes;
             for (uint32_t p = 0; p < num_pts; ++p) {
-                const int32_t gx = fp32_to_q16(grid[2 * p]);
-                const int32_t gy = fp32_to_q16(grid[2 * p + 1]);
+                // grid row layout: [x of every point | y of every point]
+                const int32_t gx = fp32_to_q16(grid[p]);
+                const int32_t gy = fp32_to_q16(grid[num_pts_padded + p]);
                 // Points outside the image (or masked) were moved to -3 by the host graph.
                 if (gx <= -Q16_ONE || gx >= Q16_ONE || gy <= -Q16_ONE || gy >= Q16_ONE) {
                     continue;
@@ -151,8 +154,10 @@ void kernel_main() {
                         q16_mul(Q16_ONE - fy, fx),
                         q16_mul(fy, Q16_ONE - fx),
                         q16_mul(fy, fx)};
-                    // ex row layout: (group, level, point)
-                    const uint32_t ex_lp = ex_cam_l1 + ((l * num_pts_padded + p) << 1);
+                    // ex row layout: (point, level, group); the four corners share these weights.
+                    volatile tt_l1_ptr uint32_t* ex_lp = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+                        ex_cam_l1 + (((p * num_levels + l) * num_groups) << 1));
+                    const uint32_t e0 = ex_lp[0], e1 = ex_lp[1], e2 = ex_lp[2], e3 = ex_lp[3];
                     const uint32_t cam_base = c * level_h[l] * level_w[l];
                     for (uint32_t k = 0; k < 4; ++k) {
                         const int32_t x = x0 + static_cast<int32_t>(k & 1);
@@ -177,12 +182,13 @@ void kernel_main() {
                                 noc.async_read(v3, v_dfb, stick_nbytes, {.page_id = stick}, {.offset_bytes = dst});
                                 break;
                         }
-                        for (uint32_t g = 0; g < num_groups; ++g) {
-                            const uint16_t e = *reinterpret_cast<volatile tt_l1_ptr uint16_t*>(
-                                ex_lp + g * (num_levels * num_pts_padded << 1));
-                            *reinterpret_cast<volatile tt_l1_ptr uint16_t*>(et_l1 + tile_offset(g, s)) = e;
-                        }
-                        *reinterpret_cast<volatile tt_l1_ptr uint16_t*>(w_l1 + tile_offset(0, s)) =
+                        volatile tt_l1_ptr uint32_t* e =
+                            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(et_l1 + row_offset(s));
+                        e[0] = e0;
+                        e[1] = e1;
+                        e[2] = e2;
+                        e[3] = e3;
+                        *reinterpret_cast<volatile tt_l1_ptr uint16_t*>(w_l1 + row_offset(s)) =
                             q16_weight_to_bf16(corner_w[k]);
 
                         if (++s == TILE_ROWS) {
@@ -204,7 +210,7 @@ void kernel_main() {
         }
 
         // Close the anchor with a (possibly empty) last tile.
-        clear_columns(et_l1, w_l1, s);
+        clear_rows(et_l1, w_l1, s);
         *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(w_l1 + LAST_FLAG_OFFSET) = 1;
         noc.async_read_barrier();
         v_dfb.push_back(c_tiles);

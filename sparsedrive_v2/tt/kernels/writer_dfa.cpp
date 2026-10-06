@@ -21,14 +21,16 @@ constexpr uint32_t HALF_ROW_NBYTES = 64;  // 16 fp32
 
 void kernel_main() {
     const uint32_t out_addr = get_arg_val<uint32_t>(0);
-    const uint32_t anchor_start = get_arg_val<uint32_t>(1);
+    const uint32_t anchor_first = get_arg_val<uint32_t>(1);
     const uint32_t anchor_count = get_arg_val<uint32_t>(2);
+    const uint32_t anchor_stride = get_arg_val<uint32_t>(3);
 
     const auto out = TensorAccessor(out_args, out_addr);
     DataflowBuffer acc_dfb(cb_acc);
     Noc noc;
 
-    for (uint32_t a = anchor_start; a < anchor_start + anchor_count; ++a) {
+    for (uint32_t i = 0; i < anchor_count; ++i) {
+        const uint32_t a = anchor_first + i * anchor_stride;
         acc_dfb.wait_front(c_tiles);
         for (uint32_t t = 0; t < c_tiles; ++t) {
             const uint32_t row = t * TILE_NBYTES + t * HALF_ROW_NBYTES;
