@@ -28,6 +28,7 @@ Files:
   weight + reduce in one `ttnn.generic_op`; samples never go to DRAM.
 - `tt/ttnn_sparsedrive_v2.py` — decoder layers, on-device top-k / gather, trajectory composition.
 - `common.py` — asset paths and the sample input.
+- `scripts/navsim_pdm_eval.py` — NAVSIM navtest inference and PDM scoring.
 
 ## Setup
 
@@ -83,6 +84,24 @@ frame. On this frame the reference's top five final scores lie within 0.15 of 10
 
 `SDV2_ACT_DTYPE=bf16` switches the decoder activations from fp32 to bf16. On this frame
 the two settings give the same PCC and the same latency.
+
+## NAVSIM evaluation
+
+`scripts/navsim_pdm_eval.py` runs navtest through the model and scores the trajectories
+with the NAVSIM v1 PDM scorer. It needs the navsim and nuplan devkits, the navtest
+logs and sensor blobs, and a v1 metric cache (see the script's docstring).
+
+```bash
+python models/experimental/sparsedrive_v2/scripts/navsim_pdm_eval.py all --backends ttnn \
+    --worker single_machine_thread_pool --out <dir>
+```
+
+navtest, traced, fp32 activations (Blackhole p300c, single chip):
+
+| | Scenes | PDMS | NC | DAC | TTC | Comfort | EP |
+|---|---|---|---|---|---|---|---|
+| Upstream (paper) | | 92.2 | | | | | |
+| TTNN | 12146 / 12146 | 92.23 | 98.70 | 98.47 | 95.26 | 99.98 | 88.65 |
 
 ## Performance
 
