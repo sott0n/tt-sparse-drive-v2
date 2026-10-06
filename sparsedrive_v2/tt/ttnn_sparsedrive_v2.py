@@ -266,9 +266,7 @@ class TtSparseDriveV2:
         values = []
         for f in feats:
             t = ttnn.to_layout(f.tensor, ttnn.ROW_MAJOR_LAYOUT)
-            t = ttnn.reshape(t, (f.n, f.h, f.w, f.c))
-            # The DFA re-reads each feature stick many times; DRAM bandwidth bounds it, L1 does not.
-            values.append(ttnn.to_memory_config(t, ttnn.L1_MEMORY_CONFIG))
+            values.append(ttnn.reshape(t, (f.n, f.h, f.w, f.c)))
         last = feats[-1]
         img_value = ttnn.reshape(last.tensor, (1, last.n * last.h * last.w, last.c))
         cam = camera_context(dev)
