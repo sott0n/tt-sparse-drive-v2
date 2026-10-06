@@ -88,13 +88,14 @@ Blackhole p300c (one chip), batch 1, warm program cache
 
 | Mode | Throughput (frames pipelined) | Single-frame latency |
 |---|---|---|
-| eager | 244 ms (4.1 FPS) | 255 ms |
-| traced (`TracedSparseDriveV2`) | 244 ms (4.1 FPS) | 255 ms |
+| eager | 237 ms (4.2 FPS) | 241 ms |
+| traced (`TracedSparseDriveV2`) | 236 ms (4.2 FPS) | 238 ms |
 
-The forward is device-bound, so tracing does not change the time. The decoder
-dispatches far faster than the device runs it. Of the single-frame latency, ~21 ms is
-the input pipeline: host preprocessing takes 12 ms, and the host-to-device copy of the
-images, padded to 16 channels for the stem conv, takes 9 ms.
+The forward is device-bound, so tracing barely changes the time. The decoder
+dispatches far faster than the device runs it. The input pipeline costs ~4 ms:
+images are uploaded as 3-channel NCHW bf16, and the NHWC permute plus the channel
+padding for the stem conv run on device. Padding on the host and uploading 16
+channels took ~21 ms.
 
 Device kernel time per stage, from the device profiler
 (`tests/perf/test_profile_forward.py`, warm iteration):

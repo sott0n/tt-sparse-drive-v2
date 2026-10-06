@@ -145,16 +145,24 @@ class TtResNet34:
         self.layers = [[TtBasicBlock(device, blk) for blk in getattr(ref, f"layer{i}")] for i in range(1, 5)]
 
     def host_input(self, imgs: torch.Tensor) -> ttnn.Tensor:
-        """(N, 3, H, W) float torch -> host tensor in conv2d layout (1, 1, N*H*W, 16)."""
+        """(N, 3, H, W) float torch -> host bf16 tensor, still NCHW with 3 channels.
+
+        The NHWC permute and the channel padding run on device (``stem_input``): uploading
+        3 channels instead of 16 is ~5x less data and skips a slow host permute.
+        """
+        return ttnn.from_torch(imgs, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
+
+    def stem_input(self, imgs: ttnn.Tensor) -> FeatureMap:
+        """Device (N, 3, H, W) -> stem-conv input (1, 1, N*H*W, 16) in NHWC order."""
         n, c, h, w = imgs.shape
-        x = torch.nn.functional.pad(imgs, (0, 0, 0, 0, 0, self.STEM_IN_CHANNELS - c))
-        x = x.permute(0, 2, 3, 1).reshape(1, 1, n * h * w, self.STEM_IN_CHANNELS)
-        return ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
+        x = ttnn.permute(imgs, (0, 2, 3, 1))
+        x = ttnn.pad(x, [(0, 0), (0, 0), (0, 0), (0, self.STEM_IN_CHANNELS - c)], 0.0)
+        x = ttnn.reshape(x, (1, 1, n * h * w, self.STEM_IN_CHANNELS))
+        return FeatureMap(x, n, h, w, self.STEM_IN_CHANNELS)
 
     def preprocess(self, imgs: torch.Tensor) -> FeatureMap:
         """(N, 3, H, W) float torch -> device FeatureMap in conv2d layout."""
-        n, _, h, w = imgs.shape
-        return FeatureMap(ttnn.to_device(self.host_input(imgs), self.device), n, h, w, self.STEM_IN_CHANNELS)
+        return self.stem_input(ttnn.to_device(self.host_input(imgs), self.device))
 
     def __call__(self, x: FeatureMap) -> List[FeatureMap]:
         x = self.stem(x)

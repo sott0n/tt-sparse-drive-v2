@@ -26,7 +26,7 @@ import torch
 
 import ttnn
 from models.experimental.sparsedrive_v2.reference.sparsedrive_v2 import SparseDriveV2Config
-from models.experimental.sparsedrive_v2.tt.ttnn_backbone import FeatureMap, TtSparseBackbone
+from models.experimental.sparsedrive_v2.tt.ttnn_backbone import TtSparseBackbone
 from models.experimental.sparsedrive_v2.tt.ttnn_dfa import (
     TtDeformableFeatureAggregation,
     camera_context,
@@ -246,10 +246,8 @@ class TtSparseDriveV2:
 
     def host_inputs(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, ttnn.Tensor]:
         """Host tensors of one frame (``common.sample_inputs`` layout, batch size 1)."""
-        imgs = inputs["imgs"][0]
-        self._img_shape = (imgs.shape[0], imgs.shape[2], imgs.shape[3])
         host = {
-            "imgs": self.backbone.resnet.host_input(imgs),
+            "imgs": self.backbone.resnet.host_input(inputs["imgs"][0]),
             "status": ttnn.from_torch(
                 inputs["status_feature"].reshape(1, 1, -1).float(), dtype=ACT_DTYPE, layout=ttnn.TILE_LAYOUT
             ),
@@ -264,9 +262,7 @@ class TtSparseDriveV2:
 
     def encode(self, dev: Dict[str, ttnn.Tensor]):
         """Backbone + per-frame decoder context from device inputs."""
-        n, h, w = self._img_shape
-        stem_in = FeatureMap(dev["imgs"], n, h, w, self.backbone.resnet.STEM_IN_CHANNELS)
-        feats = self.backbone.fpn(self.backbone.resnet(stem_in))
+        feats = self.backbone.fpn(self.backbone.resnet(self.backbone.resnet.stem_input(dev["imgs"])))
         values = []
         for f in feats:
             t = ttnn.to_layout(f.tensor, ttnn.ROW_MAJOR_LAYOUT)
