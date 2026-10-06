@@ -8,9 +8,7 @@ Replaces upstream's CUDA ``deformable_aggregation`` with on-device ops, per anch
   key points   X, Y = anchor_xy + learnable_fc(query)          (1, n, Pp) fp32
   projection   u, v, d = P[cam] @ [X, Y, z, 1]  (elementwise)  (cams, n, Pp) fp32
   weights      exp(weights_fc(query + camera_embed)) masked     (cams, n, G*L*Pp) fp32
-  sampling     fixed-point grid_sample per level (ttnn_grid_sample) (cams, n, Pp, C)
-  reduction    batched matmul  w_l (cams, n, G, Pp) @ S_l (cams, n, Pp, C)
-               -> sum over cams -> keep group g's channel block of row g
+  aggregate    fused sample + weight + reduce (ttnn_dfa_fused)  (n, C) fp32
   normalize    divide by the per-group softmax denominator     (1, n, C)
 
 Points are padded from P to Pp (a multiple of 32) so every level slice is tile
@@ -25,7 +23,7 @@ from typing import Dict, List
 import torch
 
 import ttnn
-from models.experimental.sparsedrive_v2.tt.ttnn_grid_sample import grid_sample_fixed_point
+from models.experimental.sparsedrive_v2.tt.ttnn_dfa_fused import deformable_aggregation_fused
 from models.experimental.sparsedrive_v2.tt.ttnn_ops import ACT_DTYPE, TtLayerNorm, TtLinear, to_device
 
 PAD_LOGIT = -30000.0
@@ -117,26 +115,14 @@ class TtDeformableFeatureAggregation:
         mask = torch.zeros(self.G, self.C)
         for g in range(self.G):
             mask[g, g * gd : (g + 1) * gd] = 1
-        self.group_mask = to_device(mask.reshape(1, 1, self.G, self.C), device)
         self.group_expand = to_device(mask, device, ttnn.float32)  # (G, C)
         # column j of the (G, L, Pp)-ordered logits belongs to group j // (L * Pp)
         seg = torch.zeros(self.G * self.L * self.Pp, self.G)
         seg[torch.arange(seg.shape[0]), torch.arange(seg.shape[0]) // (self.L * self.Pp)] = 1
         self.group_sum = to_device(seg, device, ttnn.float32)
 
-        # The auto-selected config for the (cams, n) batched G x Pp @ Pp x C matmul runs on
-        # 8 cores; spread the batch over the whole grid instead (~4x faster).
         grid = device.compute_with_storage_grid_size()
         self.core_grid = ttnn.CoreGrid(y=grid.y, x=grid.x)
-        k_tiles = self.Pp // 32
-        self.reduce_pc = ttnn.MatmulMultiCoreReuseProgramConfig(
-            compute_with_storage_grid_size=(grid.x, grid.y),
-            in0_block_w=next(b for b in (4, 3, 2, 1) if k_tiles % b == 0),
-            out_subblock_h=1,
-            out_subblock_w=4,
-            per_core_M=1,
-            per_core_N=self.C // 32,
-        )
 
     # -- anchor tables -------------------------------------------------------
 
@@ -206,10 +192,10 @@ class TtDeformableFeatureAggregation:
         ex = ttnn.multiply(ttnn.exp(ttnn.subtract(logits, shift)), ttnn.repeat(keep, (1, 1, G * L)))
         den = ttnn.matmul(ex, self.group_sum, compute_kernel_config=self.kps_fc.cfg, core_grid=self.core_grid)
         den = ttnn.sum(den, dim=0, keepdim=True)
-        ex = ttnn.reshape(ttnn.typecast(ex, ttnn.bfloat16), (cams, n, G, L * Pp))
+        ex = ttnn.to_layout(ttnn.typecast(ex, ttnn.bfloat16), ttnn.ROW_MAJOR_LAYOUT)
 
-        # Sampling grid in [-1, 1].  The kernel skips a camera unless the point lies strictly
-        # inside the image; send those points far outside so grid_sample returns zero.
+        # Sampling grid in [-1, 1].  Upstream skips a camera unless the point lies strictly
+        # inside the image; those points go far outside, where the fused kernel skips them.
         def to_grid(t):
             t = ttnn.clamp(ttnn.subtract(ttnn.multiply(t, 2.0), 1.0), min=-1.5, max=1.5)
             t = ttnn.add(ttnn.multiply(t, valid), ttnn.multiply(ttnn.subtract(valid, 1.0), 3.0))
@@ -217,21 +203,9 @@ class TtDeformableFeatureAggregation:
 
         # interleave (x, y) per point: (cams, n, 2, Pp) -> (cams, n, Pp, 2)
         grid = ttnn.transpose(ttnn.concat([to_grid(x), to_grid(y)], dim=2), -2, -1)
-        grid = ttnn.to_layout(grid, ttnn.ROW_MAJOR_LAYOUT)
+        grid = ttnn.reshape(ttnn.to_layout(grid, ttnn.ROW_MAJOR_LAYOUT), (cams, n, Pp * 2))
 
-        acc = None
-        for lvl in range(L):
-            sampled = ttnn.to_layout(grid_sample_fixed_point(values[lvl], grid), ttnn.TILE_LAYOUT)  # (cams, n, Pp, C)
-            r = ttnn.matmul(
-                ex[:, :, :, lvl * Pp : (lvl + 1) * Pp],
-                sampled,
-                dtype=ttnn.float32,
-                compute_kernel_config=self.kps_fc.cfg,
-                program_config=self.reduce_pc,
-            )
-            ttnn.deallocate(sampled)
-            acc = r if acc is None else ttnn.add(acc, r)
-        acc = ttnn.sum(acc, dim=0, keepdim=True)  # (1, n, G, C) summed over cameras
-        acc = ttnn.sum(ttnn.multiply(acc, self.group_mask), dim=2)  # keep group g's channels of row g
+        acc = deformable_aggregation_fused(values, grid, ex, self.P, G)  # (n, C)
+        acc = ttnn.reshape(ttnn.to_layout(acc, ttnn.TILE_LAYOUT), (1, n, C))
         den = ttnn.matmul(den, self.group_expand, compute_kernel_config=self.kps_fc.cfg)  # (1, n, C)
         return ttnn.div(acc, den)

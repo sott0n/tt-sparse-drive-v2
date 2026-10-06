@@ -22,11 +22,10 @@ Files:
 - `reference/sparsedrive_v2.py` — inference-only PyTorch reference. Upstream's CUDA
   `deformable_aggregation` is replaced by a torch implementation of the same kernel.
 - `tt/ttnn_backbone.py` — ResNet-34 + FPN.
-- `tt/ttnn_dfa.py` — deformable feature aggregation (projection, masked softmax weights,
-  bilinear sampling, batched-matmul reduction).
-- `tt/ttnn_grid_sample.py` + `tt/kernels/reader_grid_sample_fixed_point.cpp` — the bilinear
-  sampler the DFA uses: `ttnn.grid_sample`'s program rebuilt with `ttnn.generic_op`, with a
-  fixed-point reader (see [Performance](#performance)).
+- `tt/ttnn_dfa.py` — deformable feature aggregation: projection, masked softmax weights,
+  then the fused aggregation below.
+- `tt/ttnn_dfa_fused.py` + `tt/kernels/{reader,compute,writer}_dfa.cpp` — fused sample +
+  weight + reduce in one `ttnn.generic_op`; samples never go to DRAM.
 - `tt/ttnn_sparsedrive_v2.py` — decoder layers, on-device top-k / gather, trajectory composition.
 - `common.py` — asset paths and the sample input.
 
@@ -54,7 +53,7 @@ benchmark.
 
 ```bash
 pytest models/experimental/sparsedrive_v2/tests/pcc/test_backbone.py      # ResNet-34 + FPN
-pytest models/experimental/sparsedrive_v2/tests/pcc/test_grid_sample.py   # fixed-point grid_sample
+pytest models/experimental/sparsedrive_v2/tests/pcc/test_dfa_fused.py     # fused aggregation kernel
 pytest models/experimental/sparsedrive_v2/tests/pcc/test_dfa.py           # deformable aggregation
 pytest models/experimental/sparsedrive_v2/tests/pcc/test_sparsedrive_v2.py  # end to end
 pytest models/experimental/sparsedrive_v2/tests/perf/test_perf.py         # eager vs traced latency
@@ -92,8 +91,8 @@ Blackhole p300c (one chip), batch 1, warm program cache
 
 | Mode | Throughput (frames pipelined) | Single-frame latency |
 |---|---|---|
-| eager | 157 ms (6.4 FPS) | 162 ms |
-| traced (`TracedSparseDriveV2`) | 157 ms (6.4 FPS) | 159 ms |
+| eager | 78 ms (12.8 FPS) | 82 ms |
+| traced (`TracedSparseDriveV2`) | 78 ms (12.8 FPS) | 80 ms |
 
 The forward is device-bound, so tracing barely changes the time. The decoder
 dispatches far faster than the device runs it. The input pipeline costs ~4 ms:
@@ -103,12 +102,12 @@ padding for the stem conv run on device.
 Device kernel time per stage, from the device profiler
 (`tests/perf/test_profile_forward.py`, warm iteration):
 
-| Stage | First port | After matmul/layout tuning | After fixed-point grid_sample |
-|---|---|---|---|
-| Backbone + FPN | 5 ms | 7 ms | 7 ms |
-| Decoder layer 0 | 254 ms | 185 ms | 120 ms |
-| Decoder layer 1 | 62 ms | 43 ms | 29 ms |
-| **Total** | **321 ms** | **235 ms** | **156 ms** |
+| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation |
+|---|---|---|---|---|
+| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms |
+| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms |
+| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms |
+| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** |
 
 What changed, in order:
 
@@ -117,7 +116,7 @@ What changed, in order:
 - **Grid build** — the sampling grid is built with concat + transpose instead of `stack`.
   Dropping `grid_sample`'s grid batching was measured as a wash: it removed a 17 ms
   reshape copy, but plain `grid_sample` was ~17 ms slower.
-- **Fixed-point grid_sample** (`tt/ttnn_grid_sample.py`) — 128 ms -> 49 ms in total.
+- **Fixed-point grid_sample** — 128 ms -> 49 ms in total.
   Accumulating profiler zones placed inside `ttnn.grid_sample`'s kernels showed the op is
   reader-bound. ~60% of the reader's time went to the per-point sampling geometry. The
   data-movement cores have no FPU, so every float op compiles to a software routine
@@ -127,10 +126,13 @@ What changed, in order:
   kernels, unchanged. On the layer-0 shape it runs 2.5x faster at the same PCC against
   torch (0.999993).
 
-What remains: tilizing the sampled tensor (24 ms), the reduction matmuls (22 ms) and
-reshapes (16 ms). All three exist only because the samples are materialized in DRAM.
-A fused deformable-aggregation op that samples and accumulates in one kernel would
-remove them.
+- **Fused aggregation** (`tt/ttnn_dfa_fused.py`) — sampling, weighting and the reduction
+  run in one op, which removes the sampled tensor, its tilize and the reduction matmuls.
+  Per anchor, the reader keeps only bilinear corners inside the feature map. Samples whose
+  projection misses every image are not read: that is 69% of them at layer 0. Every 32
+  kept samples become one tile. Compute forms `A = softmax weight (group x sample) *
+  bilinear weight` and accumulates `A @ V` per 32-channel group in fp32 L1. The layer-0
+  path DFA is 26 ms in four calls. PCC against a torch reference of the same sum is 0.999996.
 
 To profile:
 
