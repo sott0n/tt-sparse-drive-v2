@@ -50,7 +50,8 @@ def _camera_rig(final_hw=(256, 512), orig_hw=(1080, 1920)) -> torch.Tensor:
     crop_w = int(max(0, int(W * resize) - fW) / 2)
     img_aug = np.eye(4)
     img_aug[:2, :2] *= resize
-    img_aug[:2, 3] -= np.array([crop_w, crop_h])
+    # Acts on homogeneous (u*d, v*d, d): the crop shift must scale with depth (column 2).
+    img_aug[:2, 2] -= np.array([crop_w, crop_h])
 
     K = np.eye(4)
     K[:3, :3] = [[1545.0, 0.0, 960.0], [0.0, 1545.0, 560.0], [0.0, 0.0, 1.0]]

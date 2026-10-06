@@ -74,13 +74,14 @@ Results on the sample frame (Blackhole p300c, single chip):
 | Check | Result |
 |---|---|
 | FPN levels 0-3 | PCC 0.9988 - 0.9996 |
-| Path DFA, 1024 anchors (aggregated part) | PCC 0.99998 |
-| Teacher-forced scores / 6 metric logits | PCC >= 0.997 (path L1), >= 0.9995 (others) |
-| Free-running selection overlap (vocabulary ids) | paths 0.99 / 0.95, velocities 0.98 / 1.0 |
-| Chosen trajectory | same as reference, or the neighbouring candidate (the top scores differ by < 0.2 %) |
+| Path DFA, 1024 anchors (aggregated part) | PCC 0.99999 |
+| Teacher-forced scores / 6 metric logits | PCC >= 0.999 |
+| Free-running selection overlap (vocabulary ids) | paths 0.98 / 1.0, velocities 0.98 / 1.0 |
+| Chosen trajectory | same as reference (best score 10.4731 vs 10.4722) |
 
 The last row is the reason to evaluate on NAVSIM (PDMS over navtest) rather than on one
-frame. On this frame the reference's top five final scores lie within 0.15 of 10.99.
+frame. On this frame the reference's top five final scores lie within 0.02 of 10.47, so a
+tiny score error can pick a neighbouring candidate.
 
 `SDV2_ACT_DTYPE=bf16` switches the decoder activations from fp32 to bf16. On this frame
 the two settings give the same PCC and the same latency.
