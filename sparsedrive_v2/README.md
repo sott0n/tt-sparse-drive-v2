@@ -111,8 +111,8 @@ Blackhole p300c (one chip), batch 1, warm program cache
 
 | Mode | Throughput (frames pipelined) | Single-frame latency |
 |---|---|---|
-| eager | 39 ms (25.5 FPS) | 45 ms |
-| traced (`TracedSparseDriveV2`) | 39 ms (25.7 FPS) | 41 ms |
+| eager | 36 ms (27.7 FPS) | 41 ms |
+| traced (`TracedSparseDriveV2`) | 36 ms (27.9 FPS) | 37 ms |
 
 The forward is device-bound, so tracing barely changes the time. The decoder
 dispatches far faster than the device runs it. Images are uploaded as
@@ -122,12 +122,12 @@ dispatches far faster than the device runs it. Images are uploaded as
 Device kernel time per stage, from the device profiler
 (`tests/perf/test_profile_forward.py`, warm iteration):
 
-| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation | Fused tuning | Two readers | Stem input | Mask in matmul |
-|---|---|---|---|---|---|---|---|---|
-| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 5 ms | 5 ms |
-| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms | 36 ms | 29 ms | 30 ms | 25 ms |
-| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms | 10 ms | 9 ms | 9 ms | 8 ms |
-| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** | **53 ms** | **45 ms** | **44 ms** | **38 ms** |
+| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation | Fused tuning | Two readers | Stem input | Mask in matmul | Fused exp |
+|---|---|---|---|---|---|---|---|---|---|
+| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 5 ms | 5 ms | 5 ms |
+| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms | 36 ms | 29 ms | 30 ms | 25 ms | 23 ms |
+| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms | 10 ms | 9 ms | 9 ms | 8 ms | 7 ms |
+| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** | **53 ms** | **45 ms** | **44 ms** | **38 ms** | **35 ms** |
 
 What changed, in order:
 
@@ -170,6 +170,9 @@ What changed, in order:
   input per key point (0 or -3e4) through a 0/1 expansion block in the weights, instead
   of a `repeat_interleave` to (cams, n, Pp*L*G) and a multiply. Device time 43.6 -> 38.5 ms;
   navtest PDMS 92.23 -> 92.22.
+- **Fused exp** — `subtract(logits, shift)` applies `exp` in the same pass and writes the
+  bf16 weights the fused kernel reads, removing an `exp` pass and a typecast over
+  (cams, n, Pp*L*G); the denominator sums the bf16 weights. Device time 38.5 -> 35.4 ms.
 
 To profile:
 

@@ -27,6 +27,7 @@ from models.experimental.sparsedrive_v2.tt.ttnn_dfa_fused import deformable_aggr
 from models.experimental.sparsedrive_v2.tt.ttnn_ops import ACT_DTYPE, TtLayerNorm, TtLinear, to_device
 
 PAD_LOGIT = -30000.0
+_EXP = ttnn.UnaryWithParam(ttnn.UnaryOpType.EXP, 0.0)  # accurate, as ttnn.exp
 
 
 def round_up(x: int, m: int = 32) -> int:
@@ -124,7 +125,7 @@ class TtDeformableFeatureAggregation:
         # column j of the (Pp, L, G)-ordered logits belongs to group j % G
         seg = torch.zeros(self.Pp * self.L * self.G, self.G)
         seg[torch.arange(seg.shape[0]), torch.arange(seg.shape[0]) % self.G] = 1
-        self.group_sum = to_device(seg, device, ttnn.float32)
+        self.group_sum = to_device(seg, device, ttnn.bfloat16)
 
         grid = device.compute_with_storage_grid_size()
         self.core_grid = ttnn.CoreGrid(y=grid.y, x=grid.x)
@@ -198,10 +199,13 @@ class TtDeformableFeatureAggregation:
         feat = ttnn.concat([feat, mask_bias], dim=-1)
         logits = self.weights_fc(feat, dtype=ttnn.float32)  # (cams, n, Pp*L*G)
         shift = ttnn.max(ttnn.max(logits, dim=-1, keepdim=True), dim=0, keepdim=True)
-        ex = ttnn.exp(ttnn.subtract(logits, shift))
-        den = ttnn.matmul(ex, self.group_sum, compute_kernel_config=self.kps_fc.cfg, core_grid=self.core_grid)
+        # bf16 is what the fused kernel reads; the denominator sums it in fp32.
+        ex = ttnn.subtract(logits, shift, activations=[_EXP], dtype=ttnn.bfloat16)
+        den = ttnn.matmul(
+            ex, self.group_sum, dtype=ttnn.float32, compute_kernel_config=self.kps_fc.cfg, core_grid=self.core_grid
+        )
         den = ttnn.sum(den, dim=0, keepdim=True)
-        ex = ttnn.to_layout(ttnn.typecast(ex, ttnn.bfloat16), ttnn.ROW_MAJOR_LAYOUT)
+        ex = ttnn.to_layout(ex, ttnn.ROW_MAJOR_LAYOUT)
 
         # Sampling grid in [-1, 1].  Upstream skips a camera unless the point lies strictly
         # inside the image; those points go far outside, where the fused kernel skips them.
