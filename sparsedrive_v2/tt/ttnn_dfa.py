@@ -105,7 +105,11 @@ class TtDeformableFeatureAggregation:
         wf = torch.zeros(self.Pp, self.L, self.G, w.shape[-1])
         bf = torch.full((self.Pp, self.L, self.G), PAD_LOGIT)
         wf[: self.P], bf[: self.P] = w, b
-        self.weights_fc = TtLinear(device, wf.reshape(-1, w.shape[-1]), bf.reshape(-1))
+        # Extra inputs: one mask bias per key point, added to each of its L*G logits.
+        expand = torch.zeros(self.Pp, self.L * self.G, self.Pp)
+        expand[torch.arange(self.Pp), :, torch.arange(self.Pp)] = 1
+        wf = torch.cat([wf.reshape(-1, w.shape[-1]), expand.reshape(-1, self.Pp)], dim=1)
+        self.weights_fc = TtLinear(device, wf, bf.reshape(-1))
 
         enc = ref.camera_encoder
         self.cam_fc1, self.cam_ln1 = TtLinear.from_torch(device, enc[0]), TtLayerNorm(device, enc[2])
@@ -188,9 +192,13 @@ class TtDeformableFeatureAggregation:
         # Unnormalized softmax weights over (cams, levels, points) per (anchor, group).  One shift
         # per anchor is enough: per-group maxima of the released weights differ by < 6.
         feat = ttnn.add(ttnn.repeat(query, (cams, 1, 1)), frame["cam_embed"])
+        mask_bias = ttnn.multiply(ttnn.subtract(keep, 1.0), -PAD_LOGIT)  # 0 kept, -3e4 dropped
+        if mask_bias.dtype != feat.dtype:
+            mask_bias = ttnn.typecast(mask_bias, feat.dtype)
+        feat = ttnn.concat([feat, mask_bias], dim=-1)
         logits = self.weights_fc(feat, dtype=ttnn.float32)  # (cams, n, Pp*L*G)
         shift = ttnn.max(ttnn.max(logits, dim=-1, keepdim=True), dim=0, keepdim=True)
-        ex = ttnn.multiply(ttnn.exp(ttnn.subtract(logits, shift)), ttnn.repeat_interleave(keep, L * G, dim=-1))
+        ex = ttnn.exp(ttnn.subtract(logits, shift))
         den = ttnn.matmul(ex, self.group_sum, compute_kernel_config=self.kps_fc.cfg, core_grid=self.core_grid)
         den = ttnn.sum(den, dim=0, keepdim=True)
         ex = ttnn.to_layout(ttnn.typecast(ex, ttnn.bfloat16), ttnn.ROW_MAJOR_LAYOUT)
