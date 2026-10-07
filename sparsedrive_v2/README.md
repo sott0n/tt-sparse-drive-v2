@@ -111,8 +111,8 @@ Blackhole p300c (one chip), batch 1, warm program cache
 
 | Mode | Throughput (frames pipelined) | Single-frame latency |
 |---|---|---|
-| eager | 35 ms (29.0 FPS) | 40 ms |
-| traced (`TracedSparseDriveV2`) | 34 ms (29.4 FPS) | 36 ms |
+| eager | 34 ms (29.7 FPS) | 39 ms |
+| traced (`TracedSparseDriveV2`) | 33 ms (30.1 FPS) | 35 ms |
 
 The forward is device-bound, so tracing barely changes the time. The decoder
 dispatches far faster than the device runs it. Images are uploaded as
@@ -122,12 +122,12 @@ dispatches far faster than the device runs it. Images are uploaded as
 Device kernel time per stage, from the device profiler
 (`tests/perf/test_profile_forward.py`, warm iteration):
 
-| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation | Fused tuning | Two readers | Stem input | Mask in matmul | Fused exp | Sharded ResNet | Camera reductions |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 5 ms | 5 ms | 5 ms | 5 ms | 5 ms |
-| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms | 36 ms | 29 ms | 30 ms | 25 ms | 23 ms | 23 ms | 22 ms |
-| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms | 10 ms | 9 ms | 9 ms | 8 ms | 7 ms | 7 ms | 7 ms |
-| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** | **53 ms** | **45 ms** | **44 ms** | **38 ms** | **35 ms** | **35 ms** | **34 ms** |
+| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation | Fused tuning | Two readers | Stem input | Mask in matmul | Fused exp | Sharded ResNet | Camera reductions | Head split |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 5 ms | 5 ms | 5 ms | 5 ms | 5 ms | 5 ms |
+| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms | 36 ms | 29 ms | 30 ms | 25 ms | 23 ms | 23 ms | 22 ms | 21 ms |
+| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms | 10 ms | 9 ms | 9 ms | 8 ms | 7 ms | 7 ms | 7 ms | 7 ms |
+| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** | **53 ms** | **45 ms** | **44 ms** | **38 ms** | **35 ms** | **35 ms** | **34 ms** | **33 ms** |
 
 What changed, in order:
 
@@ -179,6 +179,11 @@ What changed, in order:
 - **Camera reductions** — sums and maxima over the 3 cameras (dim 0) are slices plus
   2 binary ops; ttnn's dim-0 reduce transposed the tensor twice (0.8 ms for the layer-0
   visibility count alone). Device time 34.6 -> 33.6 ms, identical outputs.
+- **Head split** — attention splits and merges heads with
+  `ttnn.transformer.split_query_key_value_and_split_heads` / `concatenate_heads` and
+  multiplies by K with `transpose_b`, instead of reshape + permute + transpose. The fused
+  split is used only for tile-multiple lengths: it leaves K's tile padding non-zero, which
+  the softmax over 400 trajectories would see. Device time 33.6 -> 32.9 ms, identical outputs.
 
 To profile:
 

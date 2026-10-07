@@ -104,20 +104,23 @@ class TtMultiheadAttention:
         """query: (1, Nq, d); key_value: (1, Nk, d) or None for self-attention."""
         d = self.num_heads * self.head_dim
         nq = query.shape[1]
-        if key_value is None:
+        if key_value is None and nq % ttnn.TILE_SIZE == 0:
+            q, k, v = ttnn.transformer.split_query_key_value_and_split_heads(
+                self.qkv(query), num_heads=self.num_heads, transpose_key=False
+            )
+        elif key_value is None:
+            # The fused split leaves the key's tile padding non-zero, which the softmax sees.
             qkv = self.qkv(query)
-            q, k, v = qkv[:, :, :d], qkv[:, :, d : 2 * d], qkv[:, :, 2 * d :]
-            nk = nq
+            q, k, v = (self._heads(qkv[:, :, i * d : (i + 1) * d], nq) for i in range(3))
         else:
-            q = self.q(query)
+            # The fused split needs equal query and key lengths.
             kv = self.kv(key_value)
-            k, v = kv[:, :, :d], kv[:, :, d:]
             nk = key_value.shape[1]
-        q, k, v = self._heads(q, nq), self._heads(k, nk), self._heads(v, nk)
-        attn = ttnn.matmul(q, ttnn.transpose(k, -2, -1), compute_kernel_config=self.cfg)
+            q = self._heads(self.q(query), nq)
+            k, v = self._heads(kv[:, :, :d], nk), self._heads(kv[:, :, d:], nk)
+        attn = ttnn.matmul(q, k, transpose_b=True, compute_kernel_config=self.cfg)
         attn = ttnn.softmax(
             ttnn.multiply(attn, self.scale), dim=-1, numeric_stable=True, compute_kernel_config=self.cfg
         )
         out = ttnn.matmul(attn, v, compute_kernel_config=self.cfg)
-        out = ttnn.reshape(ttnn.permute(out, (0, 2, 1, 3)), (1, nq, d))
-        return self.out_proj(out)
+        return self.out_proj(ttnn.transformer.concatenate_heads(out))
