@@ -53,6 +53,7 @@ class TtConv2d:
         activation=None,
     ):
         self.device = device
+        self.keep_sharded = False  # True: return conv2d's L1-sharded output as is
         self.out_channels, self.in_channels, kh, kw = weight.shape
         self.kernel_size = (kh, kw)
         self.stride = (stride, stride)
@@ -74,6 +75,10 @@ class TtConv2d:
         )
 
     def __call__(self, x: FeatureMap) -> FeatureMap:
+        if x.tensor.is_sharded():
+            # Without an explicit layout, conv2d treats a sharded input's scheme as interleaved.
+            self.conv_config.shard_layout = x.tensor.memory_config().memory_layout
+            self.conv_config.reshard_if_not_optimal = False
         out, (oh, ow), (self.weight, self.bias) = ttnn.conv2d(
             input_tensor=x.tensor,
             weight_tensor=self.weight,
@@ -93,7 +98,7 @@ class TtConv2d:
             return_output_dim=True,
             return_weights_and_bias=True,
         )
-        if out.is_sharded():
+        if out.is_sharded() and not self.keep_sharded:
             out = ttnn.sharded_to_interleaved(out, ttnn.DRAM_MEMORY_CONFIG)
         return FeatureMap(out, x.n, oh, ow, self.out_channels)
 
@@ -124,11 +129,19 @@ class TtBasicBlock:
 class TtResNet34:
     """timm ResNet-34 with ``features_only=True, out_indices=(1, 2, 3, 4)``."""
 
-    def __init__(self, device, ref):
+    def __init__(self, device, ref, sharded_stages: int = 2):
         self.device = device
         w, b = fold_bn(ref.conv1, ref.bn1)
         self.stem = TtConv2d(device, w, b, stride=2, padding=3, activation=_RELU)
         self.layers = [[TtBasicBlock(device, blk) for blk in getattr(ref, f"layer{i}")] for i in range(1, 5)]
+        # The first stages hand activations from conv to conv in L1 shards; deeper stages
+        # go through DRAM so conv2d can pick its own (block) sharding.
+        self.sharded_stages = sharded_stages
+        for layer in self.layers[:sharded_stages]:
+            for blk in layer:
+                for conv in (blk.conv1, blk.conv2, blk.downsample):
+                    if conv is not None:
+                        conv.keep_sharded = True
 
     def host_input(self, imgs: torch.Tensor) -> ttnn.Tensor:
         """(N, 3, H, W) float torch -> host bf16 tensor, still NCHW with 3 channels.
@@ -161,14 +174,19 @@ class TtResNet34:
             padding=[1, 1],
             dilation=[1, 1],
         )
-        if t.is_sharded():
+        if t.is_sharded() and self.sharded_stages == 0:
             t = ttnn.sharded_to_interleaved(t, ttnn.DRAM_MEMORY_CONFIG)
         x = FeatureMap(t, x.n, (x.h + 1) // 2, (x.w + 1) // 2, x.c)
         feats = []
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             for blk in layer:
                 x = blk(x)
-            feats.append(x)
+            if x.tensor.is_sharded():
+                dram = FeatureMap(ttnn.sharded_to_interleaved(x.tensor, ttnn.DRAM_MEMORY_CONFIG), x.n, x.h, x.w, x.c)
+                feats.append(dram)
+                x = x if i + 1 < self.sharded_stages else dram
+            else:
+                feats.append(x)
         return feats
 
 
