@@ -111,23 +111,23 @@ Blackhole p300c (one chip), batch 1, warm program cache
 
 | Mode | Throughput (frames pipelined) | Single-frame latency |
 |---|---|---|
-| eager | 46 ms (22.0 FPS) | 49 ms |
-| traced (`TracedSparseDriveV2`) | 45 ms (22.0 FPS) | 47 ms |
+| eager | 44 ms (22.7 FPS) | 49 ms |
+| traced (`TracedSparseDriveV2`) | 44 ms (22.9 FPS) | 46 ms |
 
 The forward is device-bound, so tracing barely changes the time. The decoder
-dispatches far faster than the device runs it. The input pipeline costs ~4 ms:
-images are uploaded as 3-channel NCHW bf16, and the NHWC permute plus the channel
-padding for the stem conv run on device.
+dispatches far faster than the device runs it. Images are uploaded as
+3-channel NCHW bf16; the NHWC permute runs on device and the stem conv takes the
+3 channels as they are.
 
 Device kernel time per stage, from the device profiler
 (`tests/perf/test_profile_forward.py`, warm iteration):
 
-| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation | Fused tuning | Two readers |
-|---|---|---|---|---|---|---|
-| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms |
-| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms | 36 ms | 29 ms |
-| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms | 10 ms | 9 ms |
-| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** | **53 ms** | **45 ms** |
+| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation | Fused tuning | Two readers | Stem input |
+|---|---|---|---|---|---|---|---|
+| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 5 ms |
+| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms | 36 ms | 29 ms | 30 ms |
+| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms | 10 ms | 9 ms | 9 ms |
+| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** | **53 ms** | **45 ms** | **44 ms** |
 
 What changed, in order:
 
@@ -163,6 +163,9 @@ What changed, in order:
   compute takes their tiles in turn. The reader was the bound; giving each reader whole
   anchors made them wait on each other through compute's anchor order. The layer-0 path
   DFA is 12.6 ms; each reader spends ~30% of it waiting on NoC reads.
+- **Stem input** — the stem conv reads the 3-channel image directly, without padding it to
+  16 channels or slicing it from DRAM. The padding alone was 1.65 ms (6-byte rows); the
+  backbone drops from 7.4 to 5.2 ms at the same PCC.
 
 To profile:
 

@@ -51,7 +51,6 @@ class TtConv2d:
         stride: int = 1,
         padding: int = 0,
         activation=None,
-        slice_config=None,
     ):
         self.device = device
         self.out_channels, self.in_channels, kh, kw = weight.shape
@@ -60,7 +59,6 @@ class TtConv2d:
         self.padding = (padding, padding)
         self.weight = ttnn.from_torch(weight, dtype=ttnn.bfloat16)
         self.bias = None if bias is None else ttnn.from_torch(bias.reshape(1, 1, 1, -1), dtype=ttnn.bfloat16)
-        self.slice_config = slice_config
         self.conv_config = ttnn.Conv2dConfig(
             weights_dtype=ttnn.bfloat16,
             activation=activation,
@@ -91,7 +89,6 @@ class TtConv2d:
             padding=self.padding,
             conv_config=self.conv_config,
             compute_config=self.compute_config,
-            slice_config=self.slice_config,
             dtype=ttnn.bfloat16,
             return_output_dim=True,
             return_weights_and_bias=True,
@@ -127,38 +124,25 @@ class TtBasicBlock:
 class TtResNet34:
     """timm ResNet-34 with ``features_only=True, out_indices=(1, 2, 3, 4)``."""
 
-    STEM_IN_CHANNELS = 16  # conv2d wants the input channel count padded
-
     def __init__(self, device, ref):
         self.device = device
         w, b = fold_bn(ref.conv1, ref.bn1)
-        w = torch.nn.functional.pad(w, (0, 0, 0, 0, 0, self.STEM_IN_CHANNELS - w.shape[1]))
-        self.stem = TtConv2d(
-            device,
-            w,
-            b,
-            stride=2,
-            padding=3,
-            activation=_RELU,
-            slice_config=ttnn.Conv2dSliceConfig(slice_type=ttnn.Conv2dDRAMSliceHeight, num_slices=4),
-        )
+        self.stem = TtConv2d(device, w, b, stride=2, padding=3, activation=_RELU)
         self.layers = [[TtBasicBlock(device, blk) for blk in getattr(ref, f"layer{i}")] for i in range(1, 5)]
 
     def host_input(self, imgs: torch.Tensor) -> ttnn.Tensor:
         """(N, 3, H, W) float torch -> host bf16 tensor, still NCHW with 3 channels.
 
-        The NHWC permute and the channel padding run on device (``stem_input``): uploading
-        3 channels instead of 16 is ~5x less data and skips a slow host permute.
+        The NHWC permute runs on device (``stem_input``); a host permute is slower than the
+        upload it would save.
         """
         return ttnn.from_torch(imgs, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
 
     def stem_input(self, imgs: ttnn.Tensor) -> FeatureMap:
-        """Device (N, 3, H, W) -> stem-conv input (1, 1, N*H*W, 16) in NHWC order."""
+        """Device (N, 3, H, W) -> stem-conv input (1, 1, N*H*W, 3) in NHWC order."""
         n, c, h, w = imgs.shape
-        x = ttnn.permute(imgs, (0, 2, 3, 1))
-        x = ttnn.pad(x, [(0, 0), (0, 0), (0, 0), (0, self.STEM_IN_CHANNELS - c)], 0.0)
-        x = ttnn.reshape(x, (1, 1, n * h * w, self.STEM_IN_CHANNELS))
-        return FeatureMap(x, n, h, w, self.STEM_IN_CHANNELS)
+        x = ttnn.reshape(ttnn.permute(imgs, (0, 2, 3, 1)), (1, 1, n * h * w, c))
+        return FeatureMap(x, n, h, w, c)
 
     def preprocess(self, imgs: torch.Tensor) -> FeatureMap:
         """(N, 3, H, W) float torch -> device FeatureMap in conv2d layout."""
