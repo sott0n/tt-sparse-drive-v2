@@ -164,6 +164,12 @@ What changed, in order:
   anchors made them wait on each other through compute's anchor order. The layer-0 path
   DFA is 12.6 ms; each reader spends ~30% of it waiting on NoC reads.
 
+The feature maps stay in DRAM. With them L1-interleaved, the two readers' reads
+(NCRISC on NOC1, BRISC on NOC0) wedge the NoC: the layer-1 path DFA (128 anchors) hangs
+on the first call, while 127 anchors, either NoC alone, or the watcher enabled do not.
+The NoC addresses are in range. A single reader avoids the hang, but with L1 features it
+is only ~4% faster end to end than two readers on DRAM.
+
 To profile:
 
 ```bash
