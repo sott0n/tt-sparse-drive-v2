@@ -34,6 +34,14 @@ def round_up(x: int, m: int = 32) -> int:
     return (x + m - 1) // m * m
 
 
+def _over_cams(t: ttnn.Tensor, op) -> ttnn.Tensor:
+    """Reduce dim 0 (cameras, a handful) with a binary op; ttnn's dim-0 reduce transposes twice."""
+    out = t[0:1]
+    for c in range(1, t.shape[0]):
+        out = op(out, t[c : c + 1])
+    return out
+
+
 @dataclass
 class CameraContext:
     """Per-frame camera tensors shared by every DFA module.
@@ -187,7 +195,7 @@ class TtDeformableFeatureAggregation:
             ttnn.multiply(ttnn.gt(x, 0.0), ttnn.lt(x, 1.0)), ttnn.multiply(ttnn.gt(y, 0.0), ttnn.lt(y, 1.0))
         )
         mask = ttnn.multiply(valid, ttnn.gt(depth, 1e-5))
-        any_visible = ttnn.gt(ttnn.sum(mask, dim=0, keepdim=True), 0.0)
+        any_visible = ttnn.gt(_over_cams(mask, ttnn.add), 0.0)
         keep = ttnn.rsub(ttnn.multiply(ttnn.rsub(mask, 1.0), any_visible), 1.0)  # upstream's -inf fill
 
         # Unnormalized softmax weights over (cams, levels, points) per (anchor, group).  One shift
@@ -198,13 +206,13 @@ class TtDeformableFeatureAggregation:
             mask_bias = ttnn.typecast(mask_bias, feat.dtype)
         feat = ttnn.concat([feat, mask_bias], dim=-1)
         logits = self.weights_fc(feat, dtype=ttnn.float32)  # (cams, n, Pp*L*G)
-        shift = ttnn.max(ttnn.max(logits, dim=-1, keepdim=True), dim=0, keepdim=True)
+        shift = _over_cams(ttnn.max(logits, dim=-1, keepdim=True), ttnn.maximum)
         # bf16 is what the fused kernel reads; the denominator sums it in fp32.
         ex = ttnn.subtract(logits, shift, activations=[_EXP], dtype=ttnn.bfloat16)
         den = ttnn.matmul(
             ex, self.group_sum, dtype=ttnn.float32, compute_kernel_config=self.kps_fc.cfg, core_grid=self.core_grid
         )
-        den = ttnn.sum(den, dim=0, keepdim=True)
+        den = _over_cams(den, ttnn.add)
         ex = ttnn.to_layout(ex, ttnn.ROW_MAJOR_LAYOUT)
 
         # Sampling grid in [-1, 1].  Upstream skips a camera unless the point lies strictly
