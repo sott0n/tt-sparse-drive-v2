@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from models.experimental.sparsedrive_v2.common import IMG_MEAN, IMG_STD, checkpoint_path
+from sparsedrive_v2.common import IMG_MEAN, IMG_STD, checkpoint_path
 
 BACKENDS = ("ttnn", "torch")
 CAMS = ("cam_l0", "cam_f0", "cam_r0")  # SparseDriveV2Config.cams order
@@ -83,7 +83,7 @@ def infer(cfg, args) -> None:
     from navsim.common.dataclasses import SensorConfig
     from navsim.common.dataloader import SceneLoader
 
-    from models.experimental.sparsedrive_v2.reference.sparsedrive_v2 import build_reference_model
+    from sparsedrive_v2.reference.sparsedrive_v2 import build_reference_model
 
     sensors = SensorConfig(
         cam_f0=[3],
@@ -109,7 +109,7 @@ def infer(cfg, args) -> None:
     if "ttnn" in args.backends:
         import ttnn
 
-        from models.experimental.sparsedrive_v2.tt.ttnn_sparsedrive_v2 import (
+        from sparsedrive_v2.tt.ttnn_sparsedrive_v2 import (
             TracedSparseDriveV2,
             TtSparseDriveV2,
             outputs_to_torch,

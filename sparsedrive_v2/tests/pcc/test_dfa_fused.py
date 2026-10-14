@@ -8,7 +8,7 @@ import torch
 
 import ttnn
 from models.common.utility_functions import comp_pcc
-from models.experimental.sparsedrive_v2.tt.ttnn_dfa_fused import deformable_aggregation_fused
+from sparsedrive_v2.tt.ttnn_dfa_fused import deformable_aggregation_fused
 
 
 def _reference(values, grid, ex, num_pts, groups):

@@ -23,8 +23,8 @@ from typing import Dict, List
 import torch
 
 import ttnn
-from models.experimental.sparsedrive_v2.tt.ttnn_dfa_fused import deformable_aggregation_fused
-from models.experimental.sparsedrive_v2.tt.ttnn_ops import ACT_DTYPE, TtLayerNorm, TtLinear, to_device
+from sparsedrive_v2.tt.ttnn_dfa_fused import deformable_aggregation_fused
+from sparsedrive_v2.tt.ttnn_ops import ACT_DTYPE, TtLayerNorm, TtLinear, to_device
 
 PAD_LOGIT = -30000.0
 _EXP = ttnn.UnaryWithParam(ttnn.UnaryOpType.EXP, 0.0)  # accurate, as ttnn.exp

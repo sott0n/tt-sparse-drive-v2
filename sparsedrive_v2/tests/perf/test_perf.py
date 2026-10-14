@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import ttnn
-from models.experimental.sparsedrive_v2.tt.ttnn_sparsedrive_v2 import (
+from sparsedrive_v2.tt.ttnn_sparsedrive_v2 import (
     TracedSparseDriveV2,
     TtSparseDriveV2,
     outputs_to_torch,

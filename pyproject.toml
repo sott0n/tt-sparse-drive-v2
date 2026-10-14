@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparsedrive-v2"
+version = "0.1.0"
+description = "SparseDriveV2 end-to-end driving planner on Tenstorrent Blackhole (TTNN)"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+# torch and ttnn are pinned by the deployment, not here: ttnn has no index release for the
+# pinned tt-metal, and torch must be the CPU build.
+dependencies = ["timm", "numpy", "pillow"]
+
+[tool.setuptools]
+packages = ["sparsedrive_v2", "sparsedrive_v2.reference", "sparsedrive_v2.tt"]
+
+[tool.setuptools.package-data]
+# The fused aggregation op JIT-compiles these at runtime.
+"sparsedrive_v2.tt" = ["kernels/*.cpp", "kernels/*.hpp"]

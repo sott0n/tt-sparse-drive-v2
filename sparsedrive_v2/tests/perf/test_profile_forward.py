@@ -3,14 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Device-profiler harness: two eager forwards, signposts around the warm one.
 
-    python -m tracy -p -r -v -m pytest models/experimental/sparsedrive_v2/tests/perf/test_profile_forward.py
+    python -m tracy -p -r -v -m pytest sparsedrive_v2/tests/perf/test_profile_forward.py
     tt-perf-report <ops_perf_results.csv> --start-signpost iter1_start --end-signpost iter1_end
 """
 
 import pytest
 
 import ttnn
-from models.experimental.sparsedrive_v2.tt.ttnn_sparsedrive_v2 import TtSparseDriveV2
+from sparsedrive_v2.tt.ttnn_sparsedrive_v2 import TtSparseDriveV2
 
 
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 32768}], indirect=True)

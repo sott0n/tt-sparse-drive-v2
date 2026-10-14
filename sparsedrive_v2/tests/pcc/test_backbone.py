@@ -6,7 +6,7 @@
 import pytest
 
 from models.common.utility_functions import comp_pcc
-from models.experimental.sparsedrive_v2.tt.ttnn_backbone import TtSparseBackbone, feature_map_to_torch
+from sparsedrive_v2.tt.ttnn_backbone import TtSparseBackbone, feature_map_to_torch
 
 
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 32768}], indirect=True)

@@ -32,6 +32,23 @@ Files:
 
 ## Setup
 
+```bash
+git clone --recursive git@github.com:sott0n/tt-sparse-drive-v2.git
+cd tt-sparse-drive-v2/third_party/tt-metal
+./build_metal.sh && ./create_venv.sh     # see tt-metal docs
+cd ../..
+source third_party/tt-metal/python_env/bin/activate
+export TT_METAL_HOME=$PWD/third_party/tt-metal
+export PYTHONPATH=$PWD:$TT_METAL_HOME
+```
+
+On one chip of a 2-chip p300 board, pick the chip and give it a 1x1 mesh:
+
+```bash
+export TT_VISIBLE_DEVICES=0   # /dev/tenstorrent/0, seen as device 0 in-process
+export TT_MESH_GRAPH_DESC_PATH=$TT_METAL_HOME/tt_metal/fabric/mesh_graph_descriptors/p150_mesh_graph_descriptor.textproto
+```
+
 Assets are read from `$SDV2_ASSET_DIR` (default `~/.cache/sparsedrive_v2`):
 
 ```bash
@@ -45,7 +62,7 @@ The model reads only the checkpoint; the vocabulary is stored in it as buffers.
 The `.npy`/`.npz` files are the upstream source of those buffers.
 
 **Sample input.** NAVSIM data is not bundled. `common.sample_inputs()` uses three real
-nuScenes front-camera images (from `models/experimental/petr/resources`) standing in for
+nuScenes front-camera images (tt-metal's `models/experimental/petr/resources`) standing in for
 `cam_l0 / cam_f0 / cam_r0`, with a synthetic NAVSIM-like camera rig. It exercises every
 code path with realistic image statistics, but it is a single frame, not an accuracy
 benchmark.
@@ -53,11 +70,11 @@ benchmark.
 ## Tests
 
 ```bash
-pytest models/experimental/sparsedrive_v2/tests/pcc/test_backbone.py      # ResNet-34 + FPN
-pytest models/experimental/sparsedrive_v2/tests/pcc/test_dfa_fused.py     # fused aggregation kernel
-pytest models/experimental/sparsedrive_v2/tests/pcc/test_dfa.py           # deformable aggregation
-pytest models/experimental/sparsedrive_v2/tests/pcc/test_sparsedrive_v2.py  # end to end
-pytest models/experimental/sparsedrive_v2/tests/perf/test_perf.py         # eager vs traced latency
+pytest sparsedrive_v2/tests/pcc/test_backbone.py      # ResNet-34 + FPN
+pytest sparsedrive_v2/tests/pcc/test_dfa_fused.py     # fused aggregation kernel
+pytest sparsedrive_v2/tests/pcc/test_dfa.py           # deformable aggregation
+pytest sparsedrive_v2/tests/pcc/test_sparsedrive_v2.py  # end to end
+pytest sparsedrive_v2/tests/perf/test_perf.py         # eager vs traced latency
 ```
 
 The decoder narrows its candidates with top-k twice. A tiny score difference near the k-th
@@ -93,7 +110,7 @@ with the NAVSIM v1 PDM scorer. It needs the navsim and nuplan devkits, the navte
 logs and sensor blobs, and a v1 metric cache (see the script's docstring).
 
 ```bash
-python models/experimental/sparsedrive_v2/scripts/navsim_pdm_eval.py all --backends ttnn \
+python sparsedrive_v2/scripts/navsim_pdm_eval.py all --backends ttnn \
     --worker single_machine_thread_pool --out <dir>
 ```
 
@@ -195,7 +212,7 @@ What changed, in order:
 To profile:
 
 ```bash
-python -m tracy -p -r -v -m pytest models/experimental/sparsedrive_v2/tests/perf/test_profile_forward.py
+python -m tracy -p -r -v -m pytest sparsedrive_v2/tests/perf/test_profile_forward.py
 tt-perf-report generated/profiler/reports/<ts>/ops_perf_results_<ts>.csv \
     --start-signpost iter1_start --end-signpost iter1_end
 ```

@@ -19,7 +19,14 @@ ASSET_NAMES = (CKPT_NAME, "path_1024.npy", "velocity_256.npy", "trajectory_1024_
 IMG_MEAN = (123.675, 116.28, 103.53)
 IMG_STD = (58.395, 57.12, 57.375)
 
-_SAMPLE_DIR = Path(__file__).resolve().parents[1] / "petr" / "resources" / "sample_input"
+_SAMPLE_DIR = (
+    Path(os.environ.get("TT_METAL_HOME", Path(__file__).resolve().parents[1] / "third_party" / "tt-metal"))
+    / "models"
+    / "experimental"
+    / "petr"
+    / "resources"
+    / "sample_input"
+)
 # nuScenes front cameras standing in for NAVSIM cam_l0 / cam_f0 / cam_r0 (same order as the config).
 _SAMPLE_IMAGES = (
     "n015-2018-07-24-11-22-45+0800__CAM_FRONT_LEFT__1532402927604844.jpg",

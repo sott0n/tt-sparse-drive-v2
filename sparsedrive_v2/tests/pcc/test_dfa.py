@@ -8,8 +8,8 @@ import torch
 
 import ttnn
 from models.common.utility_functions import comp_pcc
-from models.experimental.sparsedrive_v2.tt.ttnn_dfa import TtDeformableFeatureAggregation, build_camera_context
-from models.experimental.sparsedrive_v2.tt.ttnn_ops import to_device
+from sparsedrive_v2.tt.ttnn_dfa import TtDeformableFeatureAggregation, build_camera_context
+from sparsedrive_v2.tt.ttnn_ops import to_device
 
 
 def _values(device, feature_maps):

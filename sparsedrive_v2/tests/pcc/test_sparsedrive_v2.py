@@ -16,7 +16,7 @@ stops being comparable element-wise.  The test therefore runs twice:
 import pytest
 
 from models.common.utility_functions import comp_pcc
-from models.experimental.sparsedrive_v2.tt.ttnn_sparsedrive_v2 import TtSparseDriveV2, outputs_to_torch
+from sparsedrive_v2.tt.ttnn_sparsedrive_v2 import TtSparseDriveV2, outputs_to_torch
 
 SCORE_KEYS = ("path_scores_0", "vel_scores_0", "path_scores_1", "vel_scores_1", "traj_scores", "scores")
 INDEX_KEYS = ("path_idx_0", "vel_idx_0", "path_idx_1", "vel_idx_1")

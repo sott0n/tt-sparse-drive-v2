@@ -25,14 +25,14 @@ from typing import Dict, Optional
 import torch
 
 import ttnn
-from models.experimental.sparsedrive_v2.reference.sparsedrive_v2 import SparseDriveV2Config
-from models.experimental.sparsedrive_v2.tt.ttnn_backbone import TtSparseBackbone
-from models.experimental.sparsedrive_v2.tt.ttnn_dfa import (
+from sparsedrive_v2.reference.sparsedrive_v2 import SparseDriveV2Config
+from sparsedrive_v2.tt.ttnn_backbone import TtSparseBackbone
+from sparsedrive_v2.tt.ttnn_dfa import (
     TtDeformableFeatureAggregation,
     camera_context,
     camera_host_tensors,
 )
-from models.experimental.sparsedrive_v2.tt.ttnn_ops import (
+from sparsedrive_v2.tt.ttnn_ops import (
     ACT_DTYPE,
     TtLayerNorm,
     TtLinear,

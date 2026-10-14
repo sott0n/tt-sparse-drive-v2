@@ -15,8 +15,21 @@ import os
 import pytest
 import torch
 
-from models.experimental.sparsedrive_v2.common import checkpoint_path, sample_inputs
-from models.experimental.sparsedrive_v2.reference.sparsedrive_v2 import build_reference_model
+import ttnn
+from sparsedrive_v2.common import checkpoint_path, sample_inputs
+from sparsedrive_v2.reference.sparsedrive_v2 import build_reference_model
+
+
+@pytest.fixture
+def device_params(request):
+    return getattr(request, "param", {})
+
+
+@pytest.fixture
+def device(device_params):
+    dev = ttnn.open_device(device_id=0, **device_params)
+    yield dev
+    ttnn.close_device(dev)
 
 
 @pytest.fixture(autouse=True)
