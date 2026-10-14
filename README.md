@@ -27,8 +27,10 @@ Files:
 - `tt/ttnn_dfa_fused.py` + `tt/kernels/{reader,compute}_dfa.cpp` — fused sample +
   weight + reduce in one `ttnn.generic_op`; samples never go to DRAM.
 - `tt/ttnn_sparsedrive_v2.py` — decoder layers, on-device top-k / gather, trajectory composition.
-- `common.py` — asset paths and the sample input.
+- `common.py` — asset paths, the NAVSIM camera preprocessing and the sample input.
+- `server/app.py` — HTTP server, served by tt-model (see [Serving with tt-model](#serving-with-tt-model)).
 - `scripts/navsim_pdm_eval.py` — NAVSIM navtest inference and PDM scoring.
+- `scripts/package_tt_model.sh` — stage the tt-model bundle.
 
 ## Setup
 
@@ -102,6 +104,47 @@ tiny score error can pick a neighbouring candidate.
 
 `SDV2_ACT_DTYPE=bf16` switches the decoder activations from fp32 to bf16. On this frame
 the two settings give the same PCC and the same latency.
+
+## Serving with tt-model
+
+`sparsedrive_v2/server/app.py` is an HTTP server for the model.
+[tt-model](https://github.com/tenstorrent/tt-model-manager) serves it as a v6 thin bundle with
+`kind: tt-dit-server` (uvicorn, no vLLM).
+
+```
+POST /v1/plan    {"cameras": [{"image": <base64 PNG/JPEG, RGB>, "intrinsics": 3x3,
+                               "sensor2lidar_rotation": 3x3, "sensor2lidar_translation": 3}
+                              x 3 in cam_l0, cam_f0, cam_r0 order],
+                  "status": [command one-hot (4), velocity xy, acceleration xy]}
+                 -> {"trajectory": [[x, y, heading] x 8], "timing_ms": {...}}
+GET  /v1/health, GET /v1/models
+```
+
+The camera fields are NAVSIM's (`agent_input.cameras[-1].cam_*`). Images may be any size;
+the server resizes and crops them as upstream inference does.
+
+```bash
+TT_VISIBLE_DEVICES=0 tt-model serve kyamaguchiTT/tt-sparsedrive-v2-p150x1 --port 8000
+```
+
+- The bundle carries no weights. The first start downloads `sparsedrive_navsimv1_92p2.ckpt`
+  (536 MB) from [wenchaosun/SparseDriveV2](https://huggingface.co/wenchaosun/SparseDriveV2)
+  at a pinned revision. `SDV2_CHECKPOINT_PATH=/path/to/ckpt` uses a local copy instead.
+- `--port` picks the port (default 20000).
+- The host needs SFPI 7.84.0 in `/opt/tenstorrent/sfpi`. ttnn wheels do not bundle SFPI.
+- The first start compiles kernels, which takes ~14 min. Later starts reuse the cache.
+- Ready when uvicorn prints "Application startup complete": the trace is captured at startup.
+
+To build the bundle from this checkout (needs a built tt-metal, `uv` and `tt-model`):
+
+```bash
+sparsedrive_v2/scripts/package_tt_model.sh <out-dir>                       # stage only
+sparsedrive_v2/scripts/package_tt_model.sh <out-dir> <org>/sparsedrive-v2  # stage and push
+```
+
+It bundles a ttnn wheel of the pinned tt-metal, since no index has one, and a `sparsedrive-v2`
+wheel with the model and its kernels. `TT_METAL_SRC` points it at another built tt-metal
+checkout of the same commit.
 
 ## NAVSIM evaluation
 

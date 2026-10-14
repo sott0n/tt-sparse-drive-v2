@@ -22,13 +22,10 @@ from typing import Dict, List
 
 import numpy as np
 import torch
-from PIL import Image
 
-from sparsedrive_v2.common import IMG_MEAN, IMG_STD, checkpoint_path
+from sparsedrive_v2.common import CAMS, checkpoint_path, frame_inputs, lidar2img
 
 BACKENDS = ("ttnn", "torch")
-CAMS = ("cam_l0", "cam_f0", "cam_r0")  # SparseDriveV2Config.cams order
-FINAL_HW = (256, 512)
 
 
 def _compose(overrides: List[str]):
@@ -38,44 +35,14 @@ def _compose(overrides: List[str]):
         return compose(config_name="default_run_pdm_score", overrides=overrides)
 
 
-def _lidar2img(cam) -> np.ndarray:
-    """Upstream SparseDriveFeatureBuilder.get_camera_params."""
-    lidar2cam_r = np.linalg.inv(cam.sensor2lidar_rotation)
-    lidar2cam_t = cam.sensor2lidar_translation @ lidar2cam_r.T
-    lidar2cam_rt = np.eye(4)
-    lidar2cam_rt[:3, :3] = lidar2cam_r.T
-    lidar2cam_rt[3, :3] = -lidar2cam_t
-    viewpad = np.eye(4)
-    viewpad[:3, :3] = cam.intrinsics
-    return viewpad @ lidar2cam_rt.T
-
-
 def features(agent_input) -> Dict[str, torch.Tensor]:
-    """Upstream test-mode pipeline: resize to 512 wide, keep the bottom 256 rows, normalize."""
-    fh, fw = FINAL_HW
-    cams = agent_input.cameras[-1]
-    imgs, mats = [], []
-    for name in CAMS:
-        cam = getattr(cams, name)
-        h, w = cam.image.shape[:2]
-        resize = max(fh / h, fw / w)
-        nw, nh = int(w * resize), int(h * resize)
-        crop_w, crop_h = int(max(0, nw - fw) / 2), nh - fh
-        img = Image.fromarray(cam.image).resize((nw, nh)).crop((crop_w, crop_h, crop_w + fw, crop_h + fh))
-        imgs.append(((np.asarray(img, dtype=np.float32) - IMG_MEAN) / IMG_STD).astype(np.float32))
-        # Image-plane affine on homogeneous (u*d, v*d, d): its translation multiplies depth.
-        aug = np.eye(4)
-        aug[:2, :2] *= resize
-        aug[:2, 2] -= (crop_w, crop_h)
-        mats.append(aug @ _lidar2img(cam))
+    cams = [getattr(agent_input.cameras[-1], name) for name in CAMS]
     s = agent_input.ego_statuses[-1]
-    status = np.concatenate([s.driving_command, s.ego_velocity, s.ego_acceleration]).astype(np.float32)
-    return {
-        "imgs": torch.tensor(np.stack(imgs)).permute(0, 3, 1, 2).contiguous()[None],
-        "projection_mat": torch.tensor(np.stack(mats), dtype=torch.float32)[None],
-        "image_wh": torch.tensor([[fw, fh]] * len(CAMS), dtype=torch.float32)[None],
-        "status_feature": torch.tensor(status)[None],
-    }
+    return frame_inputs(
+        [cam.image for cam in cams],
+        [lidar2img(cam.intrinsics, cam.sensor2lidar_rotation, cam.sensor2lidar_translation) for cam in cams],
+        np.concatenate([s.driving_command, s.ego_velocity, s.ego_acceleration]),
+    )
 
 
 def infer(cfg, args) -> None:

@@ -10,10 +10,10 @@ license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 # torch and ttnn are pinned by the deployment, not here: ttnn has no index release for the
 # pinned tt-metal, and torch must be the CPU build.
-dependencies = ["timm", "numpy", "pillow"]
+dependencies = ["timm", "numpy", "pillow", "huggingface_hub", "fastapi", "uvicorn"]
 
 [tool.setuptools]
-packages = ["sparsedrive_v2", "sparsedrive_v2.reference", "sparsedrive_v2.tt"]
+packages = ["sparsedrive_v2", "sparsedrive_v2.reference", "sparsedrive_v2.server", "sparsedrive_v2.tt"]
 
 [tool.setuptools.package-data]
 # The fused aggregation op JIT-compiles these at runtime.
