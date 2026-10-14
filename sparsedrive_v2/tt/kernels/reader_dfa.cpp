@@ -17,9 +17,10 @@
 //
 // Two instances run per core (NCRISC and BRISC) on the same anchors, each on every other key
 // point and with its own CBs, so both sample at once; compute interleaves their tiles. The
-// first instance also writes the results: row t of ACC tile t (fp32) holds channels
-// 32t..32t+31. That write is deferred until the next anchor is queued, so waiting on compute
-// does not stall sampling.
+// second instance (BRISC, NOC0) also writes the results: row t of ACC tile t (fp32) holds
+// channels 32t..32t+31. Writing from NCRISC (NOC1) can hang the chip once the features are
+// in L1. That write is deferred until the next anchor is queued, so waiting on compute does
+// not stall sampling.
 
 #include <stdint.h>
 #include "api/compile_time_args.h"
@@ -258,7 +259,7 @@ void kernel_main() {
         if (pending) {
             write_anchor(noc, acc_dfb, out, pending_anchor);
         }
-        pending = reader_id == 0;
+        pending = reader_id == 1;
         pending_anchor = a;
     }
     if (pending) {
