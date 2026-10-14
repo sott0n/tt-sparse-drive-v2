@@ -154,7 +154,9 @@ class TtResNet34:
     def stem_input(self, imgs: ttnn.Tensor) -> FeatureMap:
         """Device (N, 3, H, W) -> stem-conv input (1, 1, N*H*W, 3) in NHWC order."""
         n, c, h, w = imgs.shape
-        x = ttnn.reshape(ttnn.permute(imgs, (0, 2, 3, 1)), (1, 1, n * h * w, c))
+        # In L1 the stem conv shards the 6-byte rows ~3x faster than from DRAM.
+        x = ttnn.permute(imgs, (0, 2, 3, 1), memory_config=ttnn.L1_MEMORY_CONFIG)
+        x = ttnn.reshape(x, (1, 1, n * h * w, c))
         return FeatureMap(x, n, h, w, c)
 
     def preprocess(self, imgs: torch.Tensor) -> FeatureMap:

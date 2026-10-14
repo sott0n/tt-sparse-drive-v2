@@ -205,7 +205,7 @@ class TtDeformableFeatureAggregation:
         if mask_bias.dtype != feat.dtype:
             mask_bias = ttnn.typecast(mask_bias, feat.dtype)
         feat = ttnn.concat([feat, mask_bias], dim=-1)
-        logits = self.weights_fc(feat, dtype=ttnn.float32)  # (cams, n, Pp*L*G)
+        logits = self.weights_fc(feat, dtype=ttnn.bfloat16)  # (cams, n, Pp*L*G)
         shift = _over_cams(ttnn.max(logits, dim=-1, keepdim=True), ttnn.maximum)
         # bf16 is what the fused kernel reads; the denominator sums it in fp32.
         ex = ttnn.subtract(logits, shift, activations=[_EXP], dtype=ttnn.bfloat16)

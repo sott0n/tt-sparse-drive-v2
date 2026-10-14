@@ -111,8 +111,8 @@ Blackhole p300c (one chip), batch 1, warm program cache
 
 | Mode | Throughput (frames pipelined) | Single-frame latency |
 |---|---|---|
-| eager | 25 ms (39.3 FPS) | 30 ms |
-| traced (`TracedSparseDriveV2`) | 25 ms (39.9 FPS) | 27 ms |
+| eager | 23 ms (42.8 FPS) | 29 ms |
+| traced (`TracedSparseDriveV2`) | 23 ms (43.6 FPS) | 25 ms |
 
 The forward is device-bound, so tracing barely changes the time. The decoder
 dispatches far faster than the device runs it. Images are uploaded as
@@ -122,12 +122,12 @@ dispatches far faster than the device runs it. Images are uploaded as
 Device kernel time per stage, from the device profiler
 (`tests/perf/test_profile_forward.py`, warm iteration):
 
-| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation | Fused tuning | Two readers | Stem input | Mask in matmul | Fused exp | Sharded ResNet | Camera reductions | Head split | L1 features |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 5 ms | 5 ms | 5 ms | 5 ms | 5 ms | 5 ms | 5 ms |
-| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms | 36 ms | 29 ms | 30 ms | 25 ms | 23 ms | 23 ms | 22 ms | 21 ms | 14 ms |
-| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms | 10 ms | 9 ms | 9 ms | 8 ms | 7 ms | 7 ms | 7 ms | 7 ms | 6 ms |
-| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** | **53 ms** | **45 ms** | **44 ms** | **38 ms** | **35 ms** | **35 ms** | **34 ms** | **33 ms** | **25 ms** |
+| Stage | First port | Matmul/layout tuning | Fixed-point grid_sample | Fused aggregation | Fused tuning | Two readers | Stem input | Mask in matmul | Fused exp | Sharded ResNet | Camera reductions | Head split | L1 features | Stem in L1, bf16 logits |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Backbone + FPN | 5 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 5 ms | 5 ms | 5 ms | 5 ms | 5 ms | 5 ms | 5 ms | 4 ms |
+| Decoder layer 0 | 254 ms | 185 ms | 120 ms | 56 ms | 36 ms | 29 ms | 30 ms | 25 ms | 23 ms | 23 ms | 22 ms | 21 ms | 14 ms | 13 ms |
+| Decoder layer 1 | 62 ms | 43 ms | 29 ms | 14 ms | 10 ms | 9 ms | 9 ms | 8 ms | 7 ms | 7 ms | 7 ms | 7 ms | 6 ms | 5 ms |
+| **Total** | **321 ms** | **235 ms** | **156 ms** | **77 ms** | **53 ms** | **45 ms** | **44 ms** | **38 ms** | **35 ms** | **35 ms** | **34 ms** | **33 ms** | **25 ms** | **23 ms** |
 
 What changed, in order:
 
@@ -188,6 +188,9 @@ What changed, in order:
   (interleaved) instead of DRAM. The three fused DFA calls drop from 15.4 to 7.1 ms. Their
   output is written by BRISC on NOC0: written by NCRISC on NOC1, next to its reads, the op
   hangs the chip. Device time 32.9 -> 24.8 ms.
+- **Stem in L1, bf16 logits** — the NHWC permute writes the image to L1, where the stem
+  conv shards its 6-byte rows ~3x faster than from DRAM. `weights_fc` outputs the softmax
+  logits in bf16, the dtype the fused exp writes anyway. Device time 24.8 -> 22.6 ms.
 
 To profile:
 
